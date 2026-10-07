@@ -64,11 +64,15 @@ Live preview uses a unique temporary `.typ` sibling so it can compile unsaved ed
 - **Refresh Preview / 刷新预览**: `⇧⌘R`.
 - Print uses the current successful preview. Sharing uses the last explicitly exported PDF.
 
-Preview updates no longer overwrite a final PDF automatically. File switches, project changes, window close and app quit prompt for unsaved changes. Chinese/English UI follows the first macOS preferred language. The bilingual template uses `PingFang SC` with a Latin font fallback; PDF fonts/language remain under control of the Typst document.
+Open files share a window with a horizontal tab bar. Click a sidebar file or use **Open** (multiple selection supported) to add a tab. Switching tabs retains each draft, selection and undo history; only the active tab has a preview compiler. An orange dot marks unsaved changes. Closing a modified tab, changing project folders, closing the window or quitting prompts to Save, Cancel or Discard. Opening a new project folder closes the current tabs after these checks.
+
+Each tab retains the project root selected when it was first opened. Reopening the same file, including through a symlink, selects its existing tab. For a different root, close and reopen the tab under that project, or set an explicit root in Settings. Imports read other files from disk, so save edits to imported tabs before compiling the main file.
+
+Preview updates no longer overwrite a final PDF automatically. Compilation errors leave the editor editable, including Chinese IME input. Chinese/English UI follows the first macOS preferred language. The bilingual template uses `PingFang SC` with a Latin font fallback; PDF fonts/language remain under control of the Typst document.
 
 ## Performance and memory
 
-The app and bundled CLI run natively on Apple Silicon. Typst uses its default available-CPU parallelism; the editor keeps one watcher per open document to retain incremental caches and observe imports. Typst compilation in this integration has no GPU or Neural Engine backend.
+The app and bundled CLI run natively on Apple Silicon. Typst uses its default available-CPU parallelism; the editor keeps one watcher for the active tab to retain incremental caches and observe imports. Typst compilation in this integration has no GPU or Neural Engine backend.
 
 Syntax regexes are cached and evaluated serially off the main thread after a short debounce, with cancellation of obsolete work. Line offsets update around UTF-16 edits instead of rescanning the source. Only the current visible syntax colors and line labels are retained; the gutter belongs to the editor's native scroll view. PDF reload requests are coalesced and snapshots read in the background; PDFKit installation preserves position and zoom.
 
@@ -85,7 +89,7 @@ Line-offset suffix shifts still scale with line count, PDF snapshots still take 
 ./benchmark.sh  # optional: repeatable line-index and tokenization A/B benchmarks
 ```
 
-The native regression runner uses `swiftc`, AppKit and PDFKit, so it works with Command Line Tools without XCTest or full Xcode. It covers executable resolution, streamed diagnostics, UTF-16 positions, logical line offsets, Chinese IME composition, real imports and PDF export, compiler failure recovery, process/artifact cleanup, low-memory compilation, 3,000 randomized native storage edits, obsolete-task cancellation, PDF coalescing/retry, font configuration and rapid preview requests. macOS filesystem watcher tests need native file-event services; restrictive shell sandboxes may suppress these events.
+The native regression runner uses `swiftc`, AppKit and PDFKit, so it works with Command Line Tools without XCTest or full Xcode. It covers executable resolution, streamed diagnostics, UTF-16 positions, logical line offsets, Chinese IME composition, real imports and PDF export, compiler failure recovery, process/artifact cleanup, low-memory compilation, 3,000 randomized native storage edits, obsolete-task cancellation, PDF coalescing/retry, font configuration, rapid preview requests, tab draft/save failure handling, independent undo, editor release, and diagnostics before native input callbacks. macOS filesystem watcher tests need native file-event services; restrictive shell sandboxes may suppress these events.
 
 ## 📄 License
 

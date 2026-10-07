@@ -17,13 +17,16 @@ struct CompilerTests {
         testTokenizerCancellation()
         testMarkedTextDefersBindingAndCompile()
         testVisibleSyntaxUsesTemporaryDrawingAttributes()
+        try testDocumentTabsPreserveBuffersAndSaveFailures()
+        testDiagnosticsCannotOverwriteTyping()
+        testTabEditorReuseAndIndependentUndo()
         try await testPreviewLatestRequestWins()
         try testFontConfigurationValidation()
         try await testRealCompileRelativeCrossFolderImportsAndExportFailurePreservesPDF()
         try await testWatchSuccessErrorRecoveryAndCleanup()
         try await testLowMemoryPreviewReleasesCompiler()
         try await testRapidPreviewRequestsKeepLatestRevision()
-        print("PASS: 17 regression groups (resolver, PATH, process timeout, diagnostics, gutter, incremental UTF16/CRLF edits, Unicode/search, syntax, cancellation, visible drawing, IME, PDF coalescing, fonts, export/imports, watch lifecycle, low-memory preview, rapid revisions)")
+        print("PASS: 20 regression groups (previous 17 plus tab buffers/save failures, diagnostics during typing/IME, reused editors and independent undo)")
     }
 
     static func testExecutablePriorityAndInvalidCustomDoNotSilentlyFallback() {
@@ -120,7 +123,7 @@ struct CompilerTests {
         let reference = LineNumberRulerView(scrollView: nil, orientation: .verticalRuler)
         var binding = ""
         let editor = EditorView(text: Binding(get: { binding }, set: { binding = $0 }), controller: EditorController(), onCommit: {})
-        let coordinator = EditorView.Coordinator(editor)
+        let coordinator = EditorView.Session(editor)
         var source = "中😀\r\nsecond\n\nend\r"
         incremental.updateLineStarts(source)
         coordinator.textStorage.replaceCharacters(in: NSRange(location: 0, length: 0), with: source)
@@ -156,6 +159,151 @@ struct CompilerTests {
         let cancelled = SyntaxHighlighter.spans(in: source, isCancelled: { checks += 1; return checks > 100 })
         expectTrue(cancelled.isEmpty)
         expectTrue(checks <= 110)
+    }
+
+    @MainActor
+    static func testDocumentTabsPreserveBuffersAndSaveFailures() throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent("TypstEdit tabs \(UUID())")
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let aURL = root.appendingPathComponent("a.typ"), bURL = root.appendingPathComponent("b.typ")
+        try "A saved".write(to: aURL, atomically: true, encoding: .utf8)
+        try "B saved".write(to: bURL, atomically: true, encoding: .utf8)
+        let workspace = DocumentWorkspace()
+        let a = try workspace.open(aURL, projectFolder: root)
+        workspace.activate(a)
+        a.source = "A unsaved"
+        let b = try workspace.open(bURL, projectFolder: root)
+        workspace.activate(b)
+        expectTrue(workspace.isDirty)
+        expectEqual(try String(contentsOf: aURL, encoding: .utf8), "A saved")
+        workspace.activate(a)
+        expectEqual(workspace.active?.source, "A unsaved")
+        let link = root.appendingPathComponent("alias.typ")
+        try FileManager.default.createSymbolicLink(at: link, withDestinationURL: aURL)
+        expectTrue(try workspace.open(link, projectFolder: root) === a)
+        expectEqual(workspace.tabs.count, 2)
+        try a.save()
+        expectFalse(a.isDirty)
+        expectEqual(try String(contentsOf: aURL, encoding: .utf8), "A unsaved")
+        b.source = "B unsaved"
+        try FileManager.default.removeItem(at: bURL)
+        try FileManager.default.createDirectory(at: bURL, withIntermediateDirectories: true)
+        expectThrows(try b.save())
+        expectTrue(b.isDirty)
+        expectEqual(b.savedSource, "B saved")
+        expectEqual(workspace.tabs.count, 2)
+        workspace.close(a)
+        expectTrue(workspace.active === b)
+        workspace.closeAll()
+        expectTrue(workspace.tabs.isEmpty)
+        expectNil(workspace.active)
+    }
+
+    @MainActor
+    static func testDiagnosticsCannotOverwriteTyping() {
+        let tab = DocumentTab(url: URL(fileURLWithPath: "/tmp/errors.typ"), projectFolder: URL(fileURLWithPath: "/tmp"),
+                              source: "#let title = \"broken\n#title\n")
+        // Deliberately stale Binding models a delayed SwiftUI repaint during diagnostics.
+        let editor = EditorView(text: .constant("old snapshot"), controller: tab.controller, onCommit: {}, document: tab)
+        let coordinator = editor.makeSession()
+        coordinator.synchronizeText()
+        let view = coordinator.textView
+        tab.controller.textView = view
+        tab.controller.errors = [TypstError(line: 1, message: "unclosed string")]
+        expectEqual(coordinator.ruler.errors, Set([1]))
+        tab.controller.errors = []
+        expectTrue(coordinator.ruler.errors.isEmpty)
+        view.setSelectedRange(NSRange(location: view.string.utf16.count, length: 0))
+        let observation = tab.objectWillChange.sink { coordinator.synchronizeText() }
+        var expected = tab.source
+        for character in "abcdef中文😀" {
+            tab.controller.errors = [TypstError(line: 1, message: "unclosed delimiter")]
+            coordinator.synchronizeText()
+            let text = String(character)
+            view.insertText(text, replacementRange: view.selectedRange())
+            // Force a diagnostic redraw before AppKit delivers textDidChange.
+            tab.controller.errors = [TypstError(line: 2, message: "expected comma")]
+            coordinator.synchronizeText()
+            expectEqual(view.string, expected + text)
+            coordinator.textDidChange(Notification(name: NSText.didChangeNotification, object: view))
+            expected += text
+            coordinator.synchronizeText()
+            expectEqual(tab.source, expected)
+            expectEqual(view.string, expected)
+            expectEqual(view.selectedRange().location, expected.utf16.count)
+            expectTrue(view.isEditable)
+        }
+        let end = expected.utf16.count
+        view.setMarkedText("ni", selectedRange: NSRange(location: 2, length: 0), replacementRange: NSRange(location: end, length: 0))
+        coordinator.textDidChange(Notification(name: NSText.didChangeNotification, object: view))
+        coordinator.synchronizeText()
+        expectEqual(tab.source, expected)
+        view.insertText("你", replacementRange: view.markedRange())
+        coordinator.textDidChange(Notification(name: NSText.didChangeNotification, object: view))
+        expectEqual(tab.source, expected + "你")
+        observation.cancel()
+        tab.dispose()
+    }
+
+    @MainActor
+    static func testTabEditorReuseAndIndependentUndo() {
+        func make(_ name: String) -> DocumentTab {
+            DocumentTab(url: URL(fileURLWithPath: "/tmp/\(name).typ"), projectFolder: URL(fileURLWithPath: "/tmp"), source: name)
+        }
+        let a = make("A"), b = make("B")
+        func editor(_ tab: DocumentTab) -> EditorView {
+            EditorView(text: .constant("stale"), controller: tab.controller, onCommit: {}, document: tab)
+        }
+        let aCoordinator = editor(a).makeSession(), bCoordinator = editor(b).makeSession()
+        for (tab, coordinator) in [(a, aCoordinator), (b, bCoordinator)] {
+            coordinator.synchronizeText()
+            let view = coordinator.textView
+            coordinator.highlighter.install(SyntaxHighlighter.spans(in: view.string), in: view)
+            view.setSelectedRange(NSRange(location: 1, length: 0))
+            expectTrue(view.undoManager === coordinator.documentUndoManager)
+            let undo = view.undoManager!
+            undo.groupsByEvent = false
+            undo.beginUndoGrouping()
+            view.insertText("!", replacementRange: view.selectedRange())
+            coordinator.textDidChange(Notification(name: NSText.didChangeNotification, object: view))
+            undo.endUndoGrouping()
+            expectEqual(tab.source, tab.url.deletingPathExtension().lastPathComponent + "!")
+        }
+        let host = NSView(frame: NSRect(x: 0, y: 0, width: 600, height: 400))
+        let bridge = EditorView.Coordinator()
+        for coordinator in [aCoordinator, bCoordinator, aCoordinator, bCoordinator, aCoordinator] {
+            bridge.mount(coordinator, in: host)
+            expectEqual(host.subviews.count, 1)
+            expectTrue(host.subviews.first === coordinator.scrollView)
+            expectTrue(coordinator.textView.isDescendant(of: host))
+        }
+        EditorView.dismantleNSView(host, coordinator: bridge)
+        expectTrue(host.subviews.isEmpty)
+        expectTrue(aCoordinator.textView.undoManager !== bCoordinator.textView.undoManager)
+        aCoordinator.detach()
+        let reused = editor(a).makeSession()
+        expectTrue(reused === aCoordinator)
+        reused.synchronizeText()
+        expectEqual(reused.textView.selectedRange().location, 2)
+        reused.textView.undoManager?.undo()
+        expectEqual(a.source, "A")
+        expectEqual(b.source, "B!")
+        reused.layoutManager.ensureLayout(for: reused.textContainer)
+        expectEqual(reused.layoutManager.numberOfGlyphs, 1)
+        a.dispose(); b.dispose()
+
+        // Releasing a workspace must release its retained editor, even without explicit close.
+        weak var releasedDocument: DocumentTab?
+        weak var releasedEditor: EditorView.Session?
+        autoreleasepool {
+            let document = make("released")
+            let coordinator = editor(document).makeSession()
+            releasedDocument = document
+            releasedEditor = coordinator
+        }
+        expectNil(releasedDocument)
+        expectNil(releasedEditor)
     }
 
     @MainActor
@@ -243,7 +391,7 @@ struct CompilerTests {
         var compileCalls = 0
         let controller = EditorController()
         let editor = EditorView(text: Binding(get: { source }, set: { source = $0 }), controller: controller, onCommit: { compileCalls += 1 })
-        let coordinator = EditorView.Coordinator(editor)
+        let coordinator = EditorView.Session(editor)
         let view = coordinator.textView
         view.string = source
         view.setSelectedRange(NSRange(location: 6, length: 0))

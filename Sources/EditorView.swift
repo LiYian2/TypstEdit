@@ -6,59 +6,101 @@ struct EditorView: NSViewRepresentable {
     @ObservedObject var controller: EditorController
     @EnvironmentObject var themeManager: ThemeManager
     var onCommit: () -> Void
+    weak var document: DocumentTab? = nil
 
-    func makeNSView(context: Context) -> NSScrollView {
-        let scrollView = context.coordinator.scrollView
-        let textView = context.coordinator.textView
-        
-        // --- MODIFICATION TRANSPARENCE ---
-        // On force le fond transparent au démarrage
+    // A stable SwiftUI host mounts one document's retained native editor at a time.
+    // Returning the same NSScrollView from distinct representables leaves stale native views.
+    func makeNSView(context: Context) -> NSView { NSView() }
+
+    func updateNSView(_ host: NSView, context: Context) {
+        let session = makeSession()
+        let changed = context.coordinator.active !== session
+        if changed {
+            context.coordinator.mount(session, in: host)
+        }
+        session.parent = self
+        let textView = session.textView
         textView.backgroundColor = .clear
         textView.textColor = NSColor(themeManager.textColor)
         textView.insertionPointColor = NSColor(themeManager.textColor)
-        
-        // Connecter le contrôleur
-        DispatchQueue.main.async {
-            controller.textView = textView
-            scrollView.verticalRulerView?.needsDisplay = true
+        host.appearance = NSAppearance(named: .darkAqua)
+        controller.textView = textView
+        session.synchronizeText()
+        session.ruler.errors = Set(controller.errors.filter { $0.line > 0 }.map(\.line))
+        if let document, let line = document.pendingLine {
+            document.pendingLine = nil
+            controller.goToLine(line)
         }
-        
-        return scrollView
-    }
-
-    func updateNSView(_ nsView: NSScrollView, context: Context) {
-        context.coordinator.parent = self
-        let textView = context.coordinator.textView
-        let textStorage = context.coordinator.textStorage
-        
-        // Always use dark appearance
-        nsView.appearance = NSAppearance(named: .darkAqua)
-        
-        // Update text if changed
-        if textView.string != text && !textView.hasMarkedText() {
-            let selectedRange = textView.selectedRange()
-            context.coordinator.highlighter.invalidate()
-            textStorage.beginEditing()
-            textStorage.replaceCharacters(in: NSRange(location: 0, length: textStorage.length), with: text)
-            textStorage.setAttributes([.font: NSFont.monospacedSystemFont(ofSize: 14, weight: .regular),
-                                       .foregroundColor: NSColor(white: 0.9, alpha: 1)],
-                                      range: NSRange(location: 0, length: textStorage.length))
-            textStorage.endEditing()
-            context.coordinator.scheduleHighlighting()
-            if selectedRange.location + selectedRange.length <= text.utf16.count {
-                textView.setSelectedRange(selectedRange)
+        if changed {
+            session.scheduleHighlighting()
+            DispatchQueue.main.async { [weak host, weak textView] in
+                guard let host, let textView, textView.isDescendant(of: host) else { return }
+                textView.window?.makeFirstResponder(textView)
+                textView.enclosingScrollView?.verticalRulerView?.needsDisplay = true
             }
         }
-        context.coordinator.ruler.errors = Set(controller.errors.filter { $0.line > 0 }.map(\.line))
     }
 
-    func makeCoordinator() -> Coordinator {
-        Coordinator(self)
+    func makeCoordinator() -> Coordinator { Coordinator() }
+
+    func makeSession() -> Session {
+        if let existing = document?.editor {
+            existing.parent = self
+            return existing
+        }
+        let session = Session(self)
+        document?.editor = session
+        return session
+    }
+
+    static func dismantleNSView(_ host: NSView, coordinator: Coordinator) {
+        coordinator.active?.detach()
+        coordinator.active?.scrollView.removeFromSuperview()
+        coordinator.active = nil
     }
 
     @MainActor
-    class Coordinator: NSObject, NSTextViewDelegate, @preconcurrency NSTextStorageDelegate {
-        var parent: EditorView
+    final class Coordinator {
+        var active: Session?
+        func mount(_ session: Session, in host: NSView) {
+            if let old = active {
+                if let responder = host.window?.firstResponder as? NSView, responder.isDescendant(of: old.scrollView) {
+                    host.window?.makeFirstResponder(nil)
+                }
+                old.detach()
+                old.scrollView.removeFromSuperview()
+            }
+            active = session
+            session.scrollView.frame = host.bounds
+            session.scrollView.autoresizingMask = [.width, .height]
+            host.addSubview(session.scrollView)
+        }
+    }
+
+    @MainActor
+    class Session: NSObject, NSTextViewDelegate, @preconcurrency NSTextStorageDelegate {
+        func synchronizeText() {
+            guard let parent, !nativeEditPending else { return }
+            // Read the live document, not a value captured before an asynchronous diagnostic update.
+            let content = parent.document?.source ?? parent.text
+            if textView.string != content && !textView.hasMarkedText() {
+                let selectedRange = textView.selectedRange()
+                isSynchronizing = true
+                defer { isSynchronizing = false }
+                highlighter.invalidate()
+                textStorage.beginEditing()
+                textStorage.replaceCharacters(in: NSRange(location: 0, length: textStorage.length), with: content)
+                textStorage.setAttributes([.font: NSFont.monospacedSystemFont(ofSize: 14, weight: .regular),
+                                           .foregroundColor: NSColor(white: 0.9, alpha: 1)],
+                                          range: NSRange(location: 0, length: textStorage.length))
+                textStorage.endEditing()
+                scheduleHighlighting()
+                if selectedRange.location + selectedRange.length <= content.utf16.count {
+                    textView.setSelectedRange(selectedRange)
+                }
+            }
+        }
+        var parent: EditorView?
         let highlighter = SyntaxHighlighter()
         
         let scrollView: NSScrollView
@@ -71,7 +113,10 @@ struct EditorView: NSViewRepresentable {
         var scrollObserver: NSObjectProtocol?
         var tokenTask: Task<Void, Never>?
         var tokenizer: Task<[SyntaxHighlighter.Span], Never>?
+        let documentUndoManager = UndoManager()
         var revision = 0
+        private var nativeEditPending = false
+        private var isSynchronizing = false
 
         @MainActor init(_ parent: EditorView) {
             self.parent = parent
@@ -125,6 +170,8 @@ struct EditorView: NSViewRepresentable {
             textView.backgroundColor = .clear
             
             textView.isRichText = false
+            textView.isEditable = true
+            textView.isSelectable = true
             textView.allowsUndo = true
             textView.isAutomaticQuoteSubstitutionEnabled = false
             textView.isAutomaticDashSubstitutionEnabled = false
@@ -142,24 +189,47 @@ struct EditorView: NSViewRepresentable {
             if let scrollObserver { NotificationCenter.default.removeObserver(scrollObserver) }
         }
 
+        func undoManager(for view: NSTextView) -> UndoManager? { documentUndoManager }
+
         func textDidChange(_ notification: Notification) {
             guard let textView = notification.object as? NSTextView else { return }
             // Do not replace attributed text or compile provisional Chinese IME composition.
             guard !textView.hasMarkedText() else { return }
             highlighter.invalidate()
-            parent.text = textView.string
-            parent.onCommit()
+            commitCurrentText()
             scheduleHighlighting()
+        }
+
+        func commitCurrentText() {
+            guard let parent, !textView.hasMarkedText() else { return }
+            if let document = parent.document {
+                let changed = document.source != textView.string
+                document.source = textView.string
+                nativeEditPending = false
+                if changed { NotificationCenter.default.post(name: .documentSourceDidChange, object: document) }
+            } else {
+                parent.text = textView.string
+                nativeEditPending = false
+            }
+            parent.onCommit()
+        }
+
+        func detach() {
+            highlightTask?.cancel()
+            tokenTask?.cancel()
+            tokenizer?.cancel()
+            parent = nil
         }
 
         func textStorage(_ storage: NSTextStorage, didProcessEditing editedMask: NSTextStorageEditActions,
                          range editedRange: NSRange, changeInLength delta: Int) {
             guard editedMask.contains(.editedCharacters) else { return }
+            if !isSynchronizing { nativeEditPending = true }
             revision &+= 1
             highlightTask?.cancel()
             tokenTask?.cancel()
             tokenizer?.cancel()
-            highlighter.invalidate()
+            // Avoid layout mutations while NSTextStorage is notifying its layout managers.
             // NSTextStorage also reports provisional IME edits, so the index never gets stale.
             ruler.applyEdit(in: storage.mutableString, editedRange: editedRange, changeInLength: delta)
         }
@@ -182,7 +252,7 @@ struct EditorView: NSViewRepresentable {
                     self.highlighter.install(spans, in: self.textView)
                     self.tokenizer = nil
                     self.tokenTask = nil
-                    self.parent.controller.refreshSearch()
+                    self.parent?.controller.refreshSearch()
                 }
             }
             highlightTask = task

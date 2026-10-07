@@ -222,7 +222,9 @@ final class TypstCompiler: ObservableObject {
         compilationStatus = L10n.text("Compiled successfully", "编译成功")
         errors = []
         previewURL = output
-        NotificationCenter.default.post(name: .pdfDidUpdate, object: self, userInfo: ["url": output])
+        if let file = watchedFile {
+            NotificationCenter.default.post(name: .pdfDidUpdate, object: self, userInfo: ["url": output, "file": file])
+        }
     }
 
     /// Export a captured editor revision; never copy a possibly stale live-preview PDF.

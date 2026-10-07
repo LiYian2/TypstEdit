@@ -5,13 +5,14 @@ import UniformTypeIdentifiers
 struct ContentView: View {
     @StateObject private var compiler = TypstCompiler()
     @StateObject private var fileSystem = FileSystemModel()
+    @StateObject private var workspace = DocumentWorkspace()
     
     @State private var selectedFile: URL?
-    @State private var sourceCode: String = ""
     @State private var currentPDFURL: URL? // Preview PDF for live viewing
     @State private var exportedPDFURL: URL?
-    @State private var loadedFile: URL?
-    @State private var savedSource = ""
+    private var loadedFile: URL? { workspace.active?.url }
+    private var sourceCode: String { workspace.active?.source ?? "" }
+    private var savedSource: String { workspace.active?.savedSource ?? "" }
     @State private var operationError: String?
     @State private var isExporting = false
     @State private var pendingLine: Int?
@@ -22,7 +23,8 @@ struct ContentView: View {
     @State private var compilationTask: Task<Void, Never>?
     @State private var compilationRequest = UUID()
     
-    @StateObject private var editorController = EditorController()
+    @StateObject private var emptyEditorController = EditorController()
+    private var editorController: EditorController { workspace.active?.controller ?? emptyEditorController }
     
     @State private var reloadToken: UUID = UUID()
     @State private var lastSaved: Date?
@@ -36,6 +38,7 @@ struct ContentView: View {
             themeManager.editorBackground
             
             VStack(spacing: 0) {
+                documentTabs
                 // Formatting Toolbar above editor
                 HStack {
                     ToolbarView(controller: editorController)
@@ -46,17 +49,48 @@ struct ContentView: View {
                 .background(Color.black.opacity(0.1))
                
                 // Editor
-                EditorView(text: $sourceCode, controller: editorController, onCommit: {
-                    scheduleCompilation()
-                })
-                .environmentObject(themeManager)
-                .padding(8)
+                if let tab = workspace.active {
+                    EditorView(text: .constant(tab.source), controller: tab.controller,
+                               onCommit: {}, document: tab)
+                        .environmentObject(themeManager)
+                        .padding(8)
+                }
             }
         }
         .frame(minWidth: 300, maxWidth: .infinity, maxHeight: .infinity)
         .cornerRadius(12)
         .shadow(color: themeManager.shadowColor, radius: themeManager.shadowRadius, x: 0, y: 5)
         .padding(.vertical, 12)
+    }
+
+    private var documentTabs: some View {
+        ScrollView(.horizontal, showsIndicators: false) {
+            HStack(spacing: 2) {
+                ForEach(workspace.tabs) { tab in
+                    HStack(spacing: 8) {
+                        Button { activateTab(tab) } label: {
+                            HStack(spacing: 5) {
+                                Text(tab.url.lastPathComponent).lineLimit(1)
+                                if tab.isDirty { Circle().fill(Color.orange).frame(width: 5, height: 5) }
+                            }
+                            .padding(.vertical, 9)
+                        }
+                        .buttonStyle(.plain)
+                        .accessibilityLabel(tab.url.lastPathComponent + (tab.isDirty ? L10n.text(" (modified)", "（未保存）") : ""))
+                        Button { closeTab(tab) } label: { Image(systemName: "xmark").font(.system(size: 9)) }
+                            .buttonStyle(.plain)
+                            .accessibilityLabel(L10n.text("Close ", "关闭 ") + tab.url.lastPathComponent)
+                    }
+                    .font(.system(size: 12))
+                    .padding(.horizontal, 10)
+                    .foregroundColor(workspace.activeID == tab.id ? themeManager.textColor : themeManager.secondaryTextColor)
+                    .background(workspace.activeID == tab.id ? Color.white.opacity(0.08) : Color.clear)
+                    .help(tab.url.path)
+                }
+            }
+        }
+        .frame(height: 34)
+        .background(Color.black.opacity(0.15))
     }
     
     var body: some View {
@@ -162,7 +196,7 @@ struct ContentView: View {
                                     Image(systemName: "magnifyingglass")
                                         .foregroundColor(.secondary)
                                         .font(.system(size: 12))
-                                    TextField(L10n.text("Search", "搜索"), text: $editorController.searchQuery)
+                                    TextField(L10n.text("Search", "搜索"), text: Binding(get: { editorController.searchQuery }, set: { editorController.searchQuery = $0 }))
                                         .textFieldStyle(.plain)
                                         .frame(width: 120)
                                         .foregroundColor(themeManager.textColor)
@@ -278,7 +312,9 @@ Rectangle().fill(Color.gray.opacity(0.3)).frame(width: 1, height: 16)
                 .onChange(of: compiler.errors) { newErrors in
                     editorController.errors = newErrors.filter { error in
                         guard let path = error.filePath else { return true }
-                        return URL(fileURLWithPath: path).lastPathComponent.hasPrefix("typstedit-preview-") || path == selectedFile?.path
+                        let file = URL(fileURLWithPath: path)
+                        return file.lastPathComponent.hasPrefix(".typstedit-preview-") ||
+                            DocumentTab.identity(file) == workspace.activeID
                     }
                     editorController.needsRedraw()
                 }
@@ -301,8 +337,8 @@ Rectangle().fill(Color.gray.opacity(0.3)).frame(width: 1, height: 16)
                 .zIndex(100)
             }
         }
-        .background(DocumentWindowGuard(edited: loadedFile != nil && sourceCode != savedSource,
-            canClose: confirmDiscard, onClose: { cancelCompilation(); compiler.cleanUp() },
+        .background(DocumentWindowGuard(edited: workspace.isDirty,
+            canClose: confirmDiscard, onClose: { cancelCompilation(); compiler.cleanUp(); workspace.closeAll() },
             onTerminate: { cancelCompilation(); compiler.cleanUp(waitForExit: true) }))
         .focusedSceneValue(\.documentActions, DocumentActions(open: openFile, save: saveFile, export: exportPDF, refresh: refreshPreview, insert: insertSnippet, hasDocument: selectedFile != nil))
         .alert(L10n.text("Operation failed", "操作失败"), isPresented: Binding(get: { operationError != nil }, set: { if !$0 { operationError = nil } })) {
@@ -310,13 +346,7 @@ Rectangle().fill(Color.gray.opacity(0.3)).frame(width: 1, height: 16)
         } message: { Text(operationError ?? "") }
         .onChange(of: selectedFile) { newValue in
             guard newValue != loadedFile else { return }
-            if confirmDiscard() { loadFile(url: newValue) }
-            else { selectedFile = loadedFile; pendingLine = nil }
-        }
-        .onChange(of: fileSystem.currentFolder) { folder in
-            if let selectedFile, let folder, !selectedFile.path.hasPrefix(folder.path + "/") {
-                self.selectedFile = nil
-            } else { scheduleCompilation() }
+            if let newValue { loadFile(url: newValue) }
         }
         .onChange(of: settings.choice) { _ in refreshPreview() }
         .onChange(of: settings.customPath) { _ in refreshPreview() }
@@ -325,9 +355,15 @@ Rectangle().fill(Color.gray.opacity(0.3)).frame(width: 1, height: 16)
         .onChange(of: settings.fontPaths) { _ in refreshPreview() }
         .onChange(of: settings.rootPath) { _ in refreshPreview() }
         .onDisappear { cancelCompilation(); compiler.cleanUp() }
+        .onReceive(NotificationCenter.default.publisher(for: .documentSourceDidChange)) { notification in
+            guard let tab = notification.object as? DocumentTab, workspace.active === tab else { return }
+            scheduleCompilation()
+        }
         .onReceive(NotificationCenter.default.publisher(for: .pdfDidUpdate)) { notification in
             guard let sender = notification.object as? TypstCompiler, sender === compiler,
-                  let url = notification.userInfo?["url"] as? URL else { return }
+                  let url = notification.userInfo?["url"] as? URL, compiler.previewURL == url,
+                  let file = notification.userInfo?["file"] as? URL,
+                  workspace.activeID == DocumentTab.identity(file) else { return }
             currentPDFURL = url
             reloadToken = UUID()
         }
@@ -346,16 +382,22 @@ Rectangle().fill(Color.gray.opacity(0.3)).frame(width: 1, height: 16)
     }
 
     func confirmDiscard() -> Bool {
-        guard loadedFile != nil, sourceCode != savedSource else { return true }
+        commitActiveEditor()
+        for tab in workspace.tabs where !confirmDiscard(tab) { return false }
+        return true
+    }
+
+    func confirmDiscard(_ tab: DocumentTab) -> Bool {
+        guard tab.isDirty else { return true }
         let alert = NSAlert()
-        alert.messageText = L10n.text("Save changes before leaving this file?", "离开文件前保存修改？")
+        alert.messageText = L10n.text("Save changes to ", "保存修改：") + tab.url.lastPathComponent + "?"
         alert.addButton(withTitle: L10n.text("Save", "保存"))
         alert.addButton(withTitle: L10n.text("Cancel", "取消"))
         alert.addButton(withTitle: L10n.text("Discard", "放弃修改"))
         switch alert.runModal() {
         case .alertFirstButtonReturn:
-            saveFile()
-            return sourceCode == savedSource
+            do { try tab.save(); return true }
+            catch { operationError = error.localizedDescription; return false }
         case .alertThirdButtonReturn: return true
         default: return false
         }
@@ -365,11 +407,11 @@ Rectangle().fill(Color.gray.opacity(0.3)).frame(width: 1, height: 16)
         guard error.line > 0 else { return }
         if let path = error.filePath,
            !URL(fileURLWithPath: path).lastPathComponent.hasPrefix("typstedit-preview-"),
-           let selectedFile {
-            let target = URL(fileURLWithPath: path, relativeTo: selectedFile.deletingLastPathComponent()).standardizedFileURL
-            if target != selectedFile, target.pathExtension == "typ", FileManager.default.fileExists(atPath: target.path) {
+           let active = workspace.active {
+            let target = URL(fileURLWithPath: path, relativeTo: active.url.deletingLastPathComponent()).standardizedFileURL
+            if DocumentTab.identity(target) != active.id, target.pathExtension == "typ", FileManager.default.fileExists(atPath: target.path) {
                 pendingLine = error.line
-                self.selectedFile = target
+                loadFile(url: target, folderHint: active.projectFolder)
                 return
             }
         }
@@ -390,34 +432,39 @@ Rectangle().fill(Color.gray.opacity(0.3)).frame(width: 1, height: 16)
     func openFile() {
         let panel = NSOpenPanel()
         panel.allowedContentTypes = [.init(filenameExtension: "typ") ?? .plainText]
-        panel.allowsMultipleSelection = false
-        if panel.runModal() == .OK, let url = panel.url {
-            guard confirmDiscard() else { return }
-            fileSystem.currentFolder = url.deletingLastPathComponent()
-            fileSystem.loadFiles()
-            selectedFile = url
+        panel.allowsMultipleSelection = true
+        if panel.runModal() == .OK {
+            let originalFolder = fileSystem.currentFolder
+            for url in panel.urls {
+                let root = originalFolder.flatMap { folder in
+                    let path = DocumentTab.identity(folder).path
+                    return DocumentTab.identity(url).path.hasPrefix(path == "/" ? "/" : path + "/") ? folder : nil
+                } ?? url.deletingLastPathComponent()
+                loadFile(url: url, folderHint: root)
+            }
         }
     }
 
-    func loadFile(url: URL?) {
+    func loadFile(url: URL?, folderHint: URL? = nil) {
+        guard let url else {
+            resetPreview()
+            workspace.closeAll()
+            selectedFile = nil
+            return
+        }
         do {
-            let content = try url.map { try String(contentsOf: $0, encoding: .utf8) } ?? ""
-            cancelCompilation()
-            compiler.cleanUp()
-            currentPDFURL = nil
-            exportedPDFURL = nil
-            lastSaved = nil
-            editorController.clearSearch()
-            editorController.textView?.undoManager?.removeAllActions()
-            sourceCode = content
-            savedSource = content
-            loadedFile = url
-            if let url { RecentFilesManager.shared.add(url: url) }
-            scheduleCompilation()
+            let folder = folderHint ?? fileSystem.currentFolder
+            let canonicalFolder = folder.map(DocumentTab.identity)
+            let canonicalFile = DocumentTab.identity(url)
+            let root = canonicalFolder.flatMap { canonicalFile.path.hasPrefix($0.path == "/" ? "/" : $0.path + "/") ? folder : nil }
+                ?? url.deletingLastPathComponent()
+            let tab = try workspace.open(url, projectFolder: root)
             if let line = pendingLine {
                 pendingLine = nil
-                DispatchQueue.main.async { editorController.goToLine(line) }
+                tab.pendingLine = line
             }
+            activateTab(tab)
+            RecentFilesManager.shared.add(url: url)
         } catch {
             pendingLine = nil
             selectedFile = loadedFile
@@ -425,19 +472,68 @@ Rectangle().fill(Color.gray.opacity(0.3)).frame(width: 1, height: 16)
         }
     }
 
+    func commitActiveEditor(endEditing: Bool = true) {
+        guard let editor = workspace.active?.editor else { return }
+        if endEditing { editor.textView.window?.makeFirstResponder(nil) }
+        if editor.textView.hasMarkedText() { editor.textView.unmarkText() }
+        editor.commitCurrentText()
+    }
+
+    func resetPreview() {
+        cancelCompilation()
+        compiler.cleanUp()
+        currentPDFURL = nil
+    }
+
+    func activateTab(_ tab: DocumentTab) {
+        if workspace.activeID != tab.id {
+            commitActiveEditor()
+            resetPreview()
+            workspace.activate(tab)
+            tab.controller.errors = []
+            exportedPDFURL = tab.exportedPDFURL
+            lastSaved = tab.lastSaved
+            selectedFile = tab.url
+            if fileSystem.currentFolder != tab.projectFolder {
+                fileSystem.currentFolder = tab.projectFolder
+                fileSystem.loadFiles()
+            }
+            scheduleCompilation()
+        }
+        selectedFile = tab.url
+        if tab.pendingLine != nil { tab.objectWillChange.send() }
+    }
+
+    func closeTab(_ tab: DocumentTab) {
+        if workspace.activeID == tab.id { commitActiveEditor() }
+        guard confirmDiscard(tab) else { return }
+        let wasActive = workspace.activeID == tab.id
+        if wasActive { resetPreview() }
+        workspace.close(tab)
+        if wasActive {
+            selectedFile = workspace.active?.url
+            exportedPDFURL = workspace.active?.exportedPDFURL
+            lastSaved = workspace.active?.lastSaved
+            if let active = workspace.active {
+                fileSystem.currentFolder = active.projectFolder
+                fileSystem.loadFiles()
+                scheduleCompilation()
+            }
+        }
+    }
+
     func saveFile() {
-        guard let url = loadedFile else { return }
+        commitActiveEditor(endEditing: false)
+        guard let tab = workspace.active else { return }
         do {
-            // Save .typ file
-            try sourceCode.write(to: url, atomically: true, encoding: .utf8)
-            RecentFilesManager.shared.add(url: url)
-            savedSource = sourceCode
+            try tab.save()
+            RecentFilesManager.shared.add(url: tab.url)
             
             // Trigger compilation to generate PDF
             scheduleCompilation()
             
             // UI Feedback
-            lastSaved = Date()
+            lastSaved = tab.lastSaved
             withAnimation {
                 showSavePopup = true
             }
@@ -453,20 +549,23 @@ Rectangle().fill(Color.gray.opacity(0.3)).frame(width: 1, height: 16)
     }
     
     func exportPDF() {
-        guard let file = selectedFile, !isExporting else { return }
+        commitActiveEditor(endEditing: false)
+        guard let tab = workspace.active, !isExporting else { return }
+        let file = tab.url
         let panel = NSSavePanel()
         panel.allowedContentTypes = [.pdf]
         panel.nameFieldStringValue = file.deletingPathExtension().lastPathComponent + ".pdf"
         panel.directoryURL = file.deletingLastPathComponent()
         guard panel.runModal() == .OK, let destination = panel.url else { return }
-        let source = sourceCode
-        let folder = fileSystem.currentFolder
+        let source = tab.source
+        let folder = tab.projectFolder
         isExporting = true
         Task {
             defer { isExporting = false }
             do {
                 try await compiler.export(source: source, fileURL: file, projectFolder: folder, destination: destination)
-                exportedPDFURL = destination
+                tab.exportedPDFURL = destination
+                if workspace.activeID == tab.id { exportedPDFURL = destination }
                 NSWorkspace.shared.activateFileViewerSelecting([destination])
             } catch { operationError = error.localizedDescription }
         }
@@ -502,11 +601,11 @@ Rectangle().fill(Color.gray.opacity(0.3)).frame(width: 1, height: 16)
 
     func scheduleCompilation() {
         cancelCompilation()
-        guard let url = selectedFile else { return }
+        guard let tab = workspace.active else { return }
         let request = compilationRequest
-        let currentSource = sourceCode
-        let fileURL = url
-        let folder = fileSystem.currentFolder
+        let currentSource = tab.source
+        let fileURL = tab.url
+        let folder = tab.projectFolder
         
         let newWorkItem = DispatchWorkItem {
             guard compilationRequest == request else { return }

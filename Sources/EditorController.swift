@@ -3,7 +3,7 @@ import AppKit
 
 @MainActor
 class EditorController: NSObject, ObservableObject {
-    @Published var errors: [TypstError] = []
+    @Published var errors: [TypstError] = [] { didSet { needsRedraw() } }
     @Published var scrollPosition: CGFloat = 0
     
     // Référence faible vers la vue native pour manipuler le texte directement
@@ -30,7 +30,9 @@ class EditorController: NSObject, ObservableObject {
     
     // Demande de redessiner la règle (numéros de ligne)
     func needsRedraw() {
-        textView?.enclosingScrollView?.verticalRulerView?.needsDisplay = true
+        if let ruler = textView?.enclosingScrollView?.verticalRulerView as? LineNumberRulerView {
+            ruler.errors = Set(errors.filter { $0.line > 0 }.map(\.line))
+        }
     }
     
     // --- Undo/Redo Functions ---

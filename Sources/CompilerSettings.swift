@@ -167,6 +167,7 @@ enum CompilerFailure: LocalizedError {
 struct CLIResult: Sendable {
     let status: Int32
     let output: String
+    var truncated = false
 }
 
 enum CLIProcess {
@@ -180,7 +181,7 @@ enum CLIProcess {
         process.waitUntilExit()
     }
     /// Drain the pipe while running to avoid deadlock on large diagnostics. A watchdog bounds custom binaries.
-    static func run(executable: String, arguments: [String], directory: URL?, timeout: TimeInterval = 60, mergeStandardError: Bool = true) -> CLIResult {
+    static func run(executable: String, arguments: [String], directory: URL?, timeout: TimeInterval = 60, mergeStandardError: Bool = true, maxOutputBytes: Int? = nil) -> CLIResult {
         let process = Process()
         process.executableURL = URL(fileURLWithPath: executable)
         process.arguments = arguments
@@ -192,10 +193,20 @@ enum CLIProcess {
             try process.run()
             let watchdog = DispatchWorkItem { if process.isRunning { stopAndWait(process) } }
             DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + timeout, execute: watchdog)
-            let data = pipe.fileHandleForReading.readDataToEndOfFile()
+            var data = Data(), truncated = false
+            if let limit = maxOutputBytes {
+                // Keep draining even after the cap so Git cannot block on a full pipe.
+                while true {
+                    let chunk = pipe.fileHandleForReading.readData(ofLength: 64 * 1024)
+                    if chunk.isEmpty { break }
+                    let remaining = max(0, limit - data.count)
+                    data.append(chunk.prefix(remaining))
+                    if chunk.count > remaining { truncated = true }
+                }
+            } else { data = pipe.fileHandleForReading.readDataToEndOfFile() }
             process.waitUntilExit()
             watchdog.cancel()
-            return CLIResult(status: process.terminationStatus, output: String(decoding: data, as: UTF8.self))
+            return CLIResult(status: process.terminationStatus, output: String(decoding: data, as: UTF8.self), truncated: truncated)
         } catch {
             return CLIResult(status: -1, output: error.localizedDescription)
         }

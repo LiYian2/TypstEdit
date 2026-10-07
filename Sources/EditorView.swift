@@ -217,6 +217,7 @@ struct EditorView: NSViewRepresentable {
         }
 
         func detach() {
+            parent?.controller.closeGitReview()
             highlightTask?.cancel()
             tokenTask?.cancel()
             tokenizer?.cancel()
@@ -233,6 +234,8 @@ struct EditorView: NSViewRepresentable {
             tokenizer?.cancel()
             // Avoid layout mutations while NSTextStorage is notifying its layout managers.
             // NSTextStorage also reports provisional IME edits, so the index never gets stale.
+            parent?.controller.closeGitReview()
+            parent?.controller.gitChanges = GitLineMarkers()
             ruler.applyEdit(in: storage.mutableString, editedRange: editedRange, changeInLength: delta)
         }
 

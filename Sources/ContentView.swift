@@ -7,6 +7,7 @@ struct ContentView: View {
     @StateObject private var fileSystem = FileSystemModel()
     @StateObject private var workspace = DocumentWorkspace()
     @StateObject private var git = GitModel()
+    @State private var historyRequest: GitHistoryRequest?
     @State private var gitRevision = UUID()
     @AppStorage("editorShowPreview") private var showPreview = true
     private var gitRequestKey: String { (fileSystem.currentFolder?.path ?? "") + (workspace.activeID?.path ?? "") + gitRevision.uuidString }
@@ -304,6 +305,17 @@ Rectangle().fill(Color.gray.opacity(0.3)).frame(width: 1, height: 16)
                                     .help(L10n.text("Share last exported PDF", "分享最近导出的 PDF"))
                             }
                             
+                            Button {
+                                commitActiveEditor()
+                                if let tab = workspace.active, let root = git.snapshot.root {
+                                    historyRequest = GitHistoryRequest(root: root, file: tab.id)
+                                }
+                            } label: { Image(systemName: "clock.arrow.circlepath") }
+                            .buttonStyle(.plain)
+                            .disabled(git.snapshot.root == nil || workspace.active == nil)
+                            .help(L10n.text("File History", "文件历史"))
+                            .accessibilityLabel(L10n.text("File History", "文件历史"))
+
                             Button { showPreview.toggle() } label: {
                                 Image(systemName: "sidebar.right")
                                     .foregroundColor(showPreview ? themeManager.textColor : .secondary)
@@ -357,6 +369,7 @@ Rectangle().fill(Color.gray.opacity(0.3)).frame(width: 1, height: 16)
                 .zIndex(100)
             }
         }
+        .sheet(item: $historyRequest) { GitHistoryView(request: $0) }
         .background(DocumentWindowGuard(edited: workspace.isDirty,
             canClose: confirmDiscard, onClose: { cancelCompilation(); compiler.cleanUp(); workspace.closeAll() },
             onTerminate: { workspace.closeAll(); cancelCompilation(); compiler.cleanUp(waitForExit: true) },

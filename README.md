@@ -73,11 +73,13 @@ Preview updates no longer overwrite a final PDF automatically. Compilation error
 ## Git, Preview and Auto Save
 
 - Git repositories show colored file badges, a branch/change list, and green/blue/red gutter marks for added/modified/deleted lines. Gutter comparisons include the current unsaved draft and staged changes relative to HEAD. The change list shows index/worktree status in two columns and can open changed `.typ` files; renames show both paths. Git is read-only here.
+- Click a green/blue/red gutter mark to inspect the old and new lines in a read-only popover. Deleted text remains visible in red; replacements highlight the changed characters. Up/down buttons navigate changes without moving or changing the draft.
+- The toolbar **File History / 文件历史** button lists the latest 100 commits for the current file, following renames along first-parent history. Selecting a commit displays its file patch against the first parent; the initial commit shows added content. History does not replace the editor buffer.
 - The **right sidebar button / 右侧预览按钮** hides or restores Preview. Hiding it expands the editor, cancels compilation, and releases the preview PDF/compiler; saving and PDF export still work. The choice persists.
 - Enable **Settings → Editing → Auto Save / 设置 → 编辑 → 自动保存** to save after one second without typing. It defaults to off. Each tab saves independently, including after compilation errors; provisional IME input is excluded. Closing prompts suspend pending saves, and cancelling resumes them.
 - If the disk file differs from the last saved version, saving pauses and retains the draft. Use **Save a Copy / 保存副本** to preserve it before reviewing the external version. No automatic retry loop or repeated alert.
 
-Git runs serially in the background, refreshes after a short typing debounce and every four seconds, and caches unchanged line diffs. Each command has a three-second timeout; obsolete results are discarded. No Git process stays resident. Homebrew Git or Apple's developer-tools Git is required; missing Git disables decorations without starting an installer. Ordinary folders require no Git installation. The change list displays up to 200 entries.
+Git runs serially in the background, refreshes after a short typing debounce and every four seconds, and caches unchanged line diffs. Each command has a three-second timeout; obsolete results are discarded. No Git process stays resident. Homebrew Git or Apple's developer-tools Git is required; missing Git disables decorations without starting an installer. Ordinary folders require no Git installation. The change list displays up to 200 entries. Review queries retain at most 4 MiB of output; hunk previews show up to 200 lines per side, commit previews up to 1,000 lines and displayed lines up to 4,000 characters. Larger previews show a truncation notice.
 
 ## Performance and memory
 

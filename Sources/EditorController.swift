@@ -2,8 +2,11 @@ import SwiftUI
 import AppKit
 
 @MainActor
-class EditorController: NSObject, ObservableObject {
+class EditorController: NSObject, ObservableObject, NSPopoverDelegate {
     @Published var errors: [TypstError] = [] { didSet { needsRedraw() } }
+    var gitRoot: URL?
+    var gitFile: URL?
+    private var gitPopover: NSPopover?
     var gitChanges = GitLineMarkers() { didSet { needsRedraw() } }
     @Published var scrollPosition: CGFloat = 0
     
@@ -34,9 +37,41 @@ class EditorController: NSObject, ObservableObject {
         if let ruler = textView?.enclosingScrollView?.verticalRulerView as? LineNumberRulerView {
             ruler.errors = Set(errors.filter { $0.line > 0 }.map(\.line))
             ruler.gitChanges = gitChanges
+            ruler.onGitClick = { [weak self, weak ruler] line, rect in
+                guard let ruler else { return }
+                self?.showGitChange(line: line, rect: rect, ruler: ruler)
+            }
         }
     }
     
+    func showGitChange(line: Int, rect: NSRect, ruler: LineNumberRulerView) {
+        guard let root = gitRoot, let file = gitFile, let textView,
+              textView.window != nil, !textView.hasMarkedText() else { return }
+        closeGitReview()
+        let popover = NSPopover()
+        popover.contentSize = NSSize(width: 620, height: 340)
+        popover.behavior = .transient
+        popover.delegate = self
+        popover.contentViewController = NSHostingController(rootView: GitHunkPopover(root: root, file: file,
+            source: textView.string, line: line, close: { [weak self] in self?.closeGitReview() }))
+        gitPopover = popover
+        popover.show(relativeTo: rect, of: ruler, preferredEdge: .maxX)
+    }
+
+    func closeGitReview() {
+        let old = gitPopover
+        gitPopover = nil
+        old?.close()
+        old?.contentViewController = nil
+    }
+
+    func popoverDidClose(_ notification: Notification) {
+        if let closed = notification.object as? NSPopover, closed === gitPopover {
+            gitPopover = nil
+            closed.contentViewController = nil
+        }
+    }
+
     // --- Undo/Redo Functions ---
     
     func undo() {

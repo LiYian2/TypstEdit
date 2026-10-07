@@ -37,3 +37,58 @@ struct GitLineMarkers: Sendable, Equatable {
         return segments[low - 1].kind
     }
 }
+
+/// Only coordinates are retained during normal editing; old text is loaded on demand.
+struct GitHunk: Sendable, Equatable {
+    let oldStart: Int
+    let oldCount: Int
+    let newStart: Int
+    let newCount: Int
+    func contains(line: Int, lineCount: Int) -> Bool {
+        if newCount == 0 { return line == min(max(1, newStart), max(1, lineCount)) }
+        return line >= newStart && line < newStart + newCount
+    }
+    static func parse(_ header: String) -> GitHunk? {
+        guard header.hasPrefix("@@ ") else { return nil }
+        let parts = header.split(separator: " ")
+        guard parts.count >= 4, parts[1].hasPrefix("-"), parts[2].hasPrefix("+") else { return nil }
+        func pair(_ part: Substring) -> (Int, Int)? {
+            let fields = part.dropFirst().split(separator: ",", omittingEmptySubsequences: false)
+            guard let start = fields.first.flatMap({ Int($0) }), start >= 0 else { return nil }
+            let count = fields.count == 1 ? 1 : Int(fields[1]) ?? -1
+            guard count >= 0 else { return nil }
+            return (start, count)
+        }
+        guard let old = pair(parts[1]), let new = pair(parts[2]) else { return nil }
+        return GitHunk(oldStart: old.0, oldCount: old.1, newStart: new.0, newCount: new.1)
+    }
+}
+
+struct GitDiffLine: Sendable, Equatable {
+    let oldNumber: Int?
+    let newNumber: Int?
+    let text: String
+    let kind: GitChangeKind?
+    var emphasis: NSRange? = nil
+}
+
+struct GitDiffPreview: Sendable {
+    var rows: [GitDiffLine] = []
+    var truncated = false
+    var heading = ""
+    var error: String? = nil
+    var previousLine: Int? = nil
+    var nextLine: Int? = nil
+}
+
+struct GitCommit: Identifiable, Sendable, Equatable {
+    var id: String { hash }
+    let hash: String
+    let parents: [String]
+    let author: String
+    let date: String
+    let subject: String
+    let path: String
+    let oldPath: String
+    let status: String
+}

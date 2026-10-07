@@ -4,6 +4,8 @@ import AppKit
 final class LineNumberRulerView: NSRulerView {
     var errors: Set<Int> = [] { didSet { needsDisplay = true } }
     var gitChanges = GitLineMarkers() { didSet { needsDisplay = true } }
+    var onGitClick: ((Int, NSRect) -> Void)?
+    private var gitHitRegions: [(line: Int, rect: NSRect)] = []
     private(set) var lineStarts = [0]
     private let font = NSFont.monospacedDigitSystemFont(ofSize: 12, weight: .regular)
 
@@ -70,7 +72,16 @@ final class LineNumberRulerView: NSRulerView {
 
     override func scrollWheel(with event: NSEvent) { scrollView?.scrollWheel(with: event) }
 
+    override func mouseDown(with event: NSEvent) {
+        let point = convert(event.locationInWindow, from: nil)
+        if let hit = gitHitRegions.first(where: { $0.rect.insetBy(dx: -3, dy: -3).contains(point) }),
+           gitChanges[hit.line] != nil {
+            onGitClick?(hit.line, hit.rect)
+        } else { super.mouseDown(with: event) }
+    }
+
     override func drawHashMarksAndLabels(in rect: NSRect) {
+        gitHitRegions.removeAll(keepingCapacity: true)
         guard let view = clientView as? NSTextView, let layout = view.layoutManager,
               let container = view.textContainer else { return }
         NSGraphicsContext.saveGraphicsState()
@@ -110,6 +121,7 @@ final class LineNumberRulerView: NSRulerView {
                     ? NSRect(x: 13, y: origin.y - 2, width: 8, height: 3)
                     : NSRect(x: 15, y: origin.y, width: 3, height: max(3, fragment.height))
                 NSBezierPath(rect: marker).fill()
+                gitHitRegions.append((index + 1, marker))
             }
             if errors.contains(index + 1) {
                 NSColor.systemRed.setFill()

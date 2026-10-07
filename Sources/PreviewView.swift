@@ -19,6 +19,9 @@ struct PreviewView: NSViewRepresentable {
         view.appearance = NSAppearance(named: .darkAqua)
         context.coordinator.load(url: url, token: reloadToken, in: view)
     }
+    static func dismantleNSView(_ view: PDFView, coordinator: Coordinator) {
+        coordinator.load(url: nil, token: nil, in: view)
+    }
     func makeCoordinator() -> Coordinator { Coordinator() }
     @MainActor class Coordinator {
         var lastURL: URL?

@@ -96,6 +96,7 @@ class FileSystemModel: ObservableObject {
 
 struct SidebarView: View {
     @ObservedObject var model: FileSystemModel
+    @ObservedObject var git: GitModel
     @Binding var selectedFile: URL?
     @EnvironmentObject var themeManager: ThemeManager
     @ObservedObject var compiler: TypstCompiler
@@ -134,7 +135,7 @@ struct SidebarView: View {
                 
                 // File Tree
                 List(model.rootNodes, children: \.children) { node in
-                    SidebarRow(node: node, selectedFile: $selectedFile)
+                    SidebarRow(node: node, change: git.change(for: node.url, directory: node.isDirectory), selectedFile: $selectedFile)
                         .listRowInsets(EdgeInsets(top: 0, leading: 10, bottom: 0, trailing: 10))
                         .listRowSeparator(.hidden)
                         .listRowBackground(
@@ -145,6 +146,42 @@ struct SidebarView: View {
                 .scrollContentBackground(.hidden)
             }
             
+            if let root = git.snapshot.root {
+                DisclosureGroup {
+                    ScrollView {
+                        LazyVStack(alignment: .leading, spacing: 6) {
+                            ForEach(git.snapshot.changes.prefix(200)) { change in
+                                HStack {
+                                    Text(change.originalPath.map { $0 + " → " + change.path } ?? change.path).lineLimit(1).truncationMode(.middle)
+                                    Spacer()
+                                    Text(String(change.index) + String(change.worktree)).monospaced()
+                                        .foregroundColor(change.kind.color)
+                                }
+                                .font(.system(size: 11))
+                                .help(L10n.text("Index / working tree: ", "暂存区 / 工作区：") + String(change.index) + String(change.worktree))
+                                .contentShape(Rectangle())
+                                .onTapGesture {
+                                    let url = root.appendingPathComponent(change.path)
+                                    if url.pathExtension == "typ", FileManager.default.fileExists(atPath: url.path) { selectedFile = url }
+                                }
+                            }
+                            if git.snapshot.changes.isEmpty { Text(L10n.text("Working tree clean", "工作区无修改")).foregroundColor(.secondary) }
+                        }
+                        .padding(.vertical, 8)
+                    }
+                    .frame(maxHeight: 150)
+                } label: {
+                    HStack {
+                        Image(systemName: "arrow.triangle.branch")
+                        Text(git.snapshot.branch.components(separatedBy: "...").first ?? git.snapshot.branch).lineLimit(1).truncationMode(.middle)
+                        Spacer()
+                        Text(String(git.snapshot.changes.count)).foregroundColor(.secondary)
+                    }
+                    .font(.system(size: 11))
+                    .help(root.path)
+                }
+                .padding(12)
+            }
             Divider()
                 .background(themeManager.secondaryTextColor.opacity(0.3))
             
@@ -160,6 +197,7 @@ struct SidebarView: View {
 
 struct SidebarRow: View {
     let node: FileNode
+    var change: GitChangeKind?
     @Binding var selectedFile: URL?
     @EnvironmentObject var themeManager: ThemeManager
     
@@ -175,9 +213,10 @@ struct SidebarRow: View {
             
             Text(node.name)
                 .font(.system(size: 13))
-                .foregroundColor(isSelected ? .white : themeManager.textColor)
+                .foregroundColor(isSelected ? .white : change?.color ?? themeManager.textColor)
             
             Spacer()
+            if let change { Text(change.badge).font(.system(size: 11, weight: .semibold)).foregroundColor(change.color) }
         }
         .padding(.vertical, 4)
         .contentShape(Rectangle()) // Make full row clickable
@@ -209,5 +248,15 @@ struct SidebarRow: View {
             return .orange
         }
         return themeManager.textColor // Match text color for better visibility in light mode
+    }
+}
+
+private extension GitChangeKind {
+    var color: Color {
+        switch self {
+        case .added, .untracked: return .green
+        case .deleted, .conflicted: return .red
+        case .modified, .renamed: return .orange
+        }
     }
 }

@@ -3,6 +3,7 @@ import AppKit
 /// The ruler shares the editor's clip view. It has no document or independent scroll offset.
 final class LineNumberRulerView: NSRulerView {
     var errors: Set<Int> = [] { didSet { needsDisplay = true } }
+    var gitChanges = GitLineMarkers() { didSet { needsDisplay = true } }
     private(set) var lineStarts = [0]
     private let font = NSFont.monospacedDigitSystemFont(ofSize: 12, weight: .regular)
 
@@ -102,6 +103,14 @@ final class LineNumberRulerView: NSRulerView {
             let label = String(index + 1) as NSString
             let size = label.size(withAttributes: [.font: font])
             let y = origin.y + max(0, (fragment.height - size.height) / 2)
+            if let change = gitChanges[index + 1] {
+                let color: NSColor = change == .added ? .systemGreen : change == .deleted ? .systemRed : .systemBlue
+                color.setFill()
+                let marker = change == .deleted
+                    ? NSRect(x: 13, y: origin.y - 2, width: 8, height: 3)
+                    : NSRect(x: 15, y: origin.y, width: 3, height: max(3, fragment.height))
+                NSBezierPath(rect: marker).fill()
+            }
             if errors.contains(index + 1) {
                 NSColor.systemRed.setFill()
                 NSBezierPath(ovalIn: NSRect(x: 4, y: y + 4, width: 6, height: 6)).fill()

@@ -206,6 +206,8 @@ struct EditorView: NSViewRepresentable {
                 let changed = document.source != textView.string
                 document.source = textView.string
                 nativeEditPending = false
+                // Composition may be cancelled without changing the committed source.
+                if !changed { document.scheduleAutoSave() }
                 if changed { NotificationCenter.default.post(name: .documentSourceDidChange, object: document) }
             } else {
                 parent.text = textView.string

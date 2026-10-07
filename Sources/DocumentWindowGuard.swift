@@ -5,8 +5,12 @@ import AppKit
 final class ApplicationDelegate: NSObject, NSApplicationDelegate {
     static var closeChecks: [UUID: () -> Bool] = [:]
     static var cleanups: [UUID: () -> Void] = [:]
+    static var closeCancellations: [UUID: () -> Void] = [:]
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
-        for check in Array(Self.closeChecks.values) where !check() { return .terminateCancel }
+        for check in Array(Self.closeChecks.values) where !check() {
+            for resume in Array(Self.closeCancellations.values) { resume() }
+            return .terminateCancel
+        }
         return .terminateNow
     }
     func applicationWillTerminate(_ notification: Notification) {
@@ -20,19 +24,23 @@ struct DocumentWindowGuard: NSViewRepresentable {
     let canClose: () -> Bool
     let onClose: () -> Void
     let onTerminate: () -> Void
+    var onCancelClose: () -> Void = {}
 
     func makeNSView(context: Context) -> GuardView { GuardView() }
     func updateNSView(_ view: GuardView, context: Context) {
         view.proxy.canClose = canClose
         view.proxy.onClose = onClose
+        view.proxy.onCancelClose = onCancelClose
         view.edited = edited
         view.window?.isDocumentEdited = edited
         ApplicationDelegate.closeChecks[view.proxy.id] = canClose
         ApplicationDelegate.cleanups[view.proxy.id] = onTerminate
+        ApplicationDelegate.closeCancellations[view.proxy.id] = onCancelClose
     }
     static func dismantleNSView(_ view: GuardView, coordinator: ()) {
         ApplicationDelegate.closeChecks.removeValue(forKey: view.proxy.id)
         ApplicationDelegate.cleanups.removeValue(forKey: view.proxy.id)
+        ApplicationDelegate.closeCancellations.removeValue(forKey: view.proxy.id)
         if view.window?.delegate === view.proxy { view.window?.delegate = view.proxy.previous }
     }
 
@@ -54,12 +62,16 @@ struct DocumentWindowGuard: NSViewRepresentable {
         weak var previous: NSWindowDelegate?
         var canClose: () -> Bool = { true }
         var onClose: () -> Void = {}
+        var onCancelClose: () -> Void = {}
         func windowShouldClose(_ sender: NSWindow) -> Bool {
-            canClose() && (previous?.windowShouldClose?(sender) ?? true)
+            let allowed = canClose() && (previous?.windowShouldClose?(sender) ?? true)
+            if !allowed { onCancelClose() }
+            return allowed
         }
         func windowWillClose(_ notification: Notification) {
             ApplicationDelegate.closeChecks.removeValue(forKey: id)
             ApplicationDelegate.cleanups.removeValue(forKey: id)
+            ApplicationDelegate.closeCancellations.removeValue(forKey: id)
             onClose()
             previous?.windowWillClose?(notification)
         }

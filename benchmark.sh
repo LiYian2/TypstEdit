@@ -4,7 +4,7 @@ cd "$(dirname "$0")"
 BENCH_BUILD="${BENCH_BUILD_DIR:-/private/tmp/typstedit-benchmark-build}"
 mkdir -p "$BENCH_BUILD/module-cache"
 swiftc -O -swift-version 5 -parse-as-library -module-cache-path "$BENCH_BUILD/module-cache" \
-  Sources/LineNumberRulerView.swift Sources/SyntaxHighlighter.swift Tests/Benchmark.swift -o "$BENCH_BUILD/index"
+  Sources/GitDecorations.swift Sources/LineNumberRulerView.swift Sources/SyntaxHighlighter.swift Tests/Benchmark.swift -o "$BENCH_BUILD/index"
 swiftc -O -swift-version 5 -parse-as-library -module-cache-path "$BENCH_BUILD/module-cache" \
   Sources/SyntaxHighlighter.swift Tests/TokenBenchmark.swift -o "$BENCH_BUILD/token"
 "$BENCH_BUILD/index"

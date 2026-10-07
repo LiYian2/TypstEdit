@@ -6,6 +6,10 @@ struct ContentView: View {
     @StateObject private var compiler = TypstCompiler()
     @StateObject private var fileSystem = FileSystemModel()
     @StateObject private var workspace = DocumentWorkspace()
+    @StateObject private var git = GitModel()
+    @State private var gitRevision = UUID()
+    @AppStorage("editorShowPreview") private var showPreview = true
+    private var gitRequestKey: String { (fileSystem.currentFolder?.path ?? "") + (workspace.activeID?.path ?? "") + gitRevision.uuidString }
     
     @State private var selectedFile: URL?
     @State private var currentPDFURL: URL? // Preview PDF for live viewing
@@ -54,6 +58,13 @@ struct ContentView: View {
                                onCommit: {}, document: tab)
                         .environmentObject(themeManager)
                         .padding(8)
+                    if let error = tab.autoSaveError {
+                        HStack {
+                            Text(L10n.text("Saving paused: ", "保存已暂停：") + error)
+                                .font(.caption).foregroundColor(.orange).textSelection(.enabled)
+                            Button(L10n.text("Save a Copy…", "保存副本…")) { saveSourceCopy() }
+                        }.padding(8)
+                    }
                 }
             }
         }
@@ -118,7 +129,7 @@ struct ContentView: View {
                 // Unified HSplitView for Transparency
                 HSplitView {
                     // LEFT: Sidebar (starts minimized)
-                    SidebarView(model: fileSystem, selectedFile: $selectedFile, compiler: compiler, editorController: editorController, onOpenFolder: openProjectFolder, onNavigateError: navigateToError)
+                    SidebarView(model: fileSystem, git: git, selectedFile: $selectedFile, compiler: compiler, editorController: editorController, onOpenFolder: openProjectFolder, onNavigateError: navigateToError)
                         .frame(minWidth: 200, idealWidth: 200, maxWidth: 400)
                     
                     // RIGHT: Main Content (Editor + PDF)
@@ -127,7 +138,7 @@ struct ContentView: View {
                             themeManager.contentOverlay.ignoresSafeArea() 
                             themeManager.mainBackground.ignoresSafeArea() // .clear
                             
-                            ResizableSplitView(initialWidth: 500) {
+                            ResizableSplitView(initialWidth: 500, showsRight: showPreview) {
                                 // Left Pane: Line Numbers + Editor
                                 HStack(spacing: 8) { // Added spacing
                                     editorBox
@@ -138,8 +149,9 @@ struct ContentView: View {
                                 ZStack {
                                     themeManager.pdfBackground
                                     
-                                    PreviewView(url: currentPDFURL, reloadToken: reloadToken)
-                                        .padding(20)
+                                    if showPreview {
+                                        PreviewView(url: currentPDFURL, reloadToken: reloadToken).padding(20)
+                                    }
                                 }
                                 .cornerRadius(12)
                                 .shadow(color: themeManager.shadowColor, radius: themeManager.shadowRadius, x: 0, y: 5)
@@ -292,7 +304,15 @@ Rectangle().fill(Color.gray.opacity(0.3)).frame(width: 1, height: 16)
                                     .help(L10n.text("Share last exported PDF", "分享最近导出的 PDF"))
                             }
                             
-                            Text(compiler.compilationStatus)
+                            Button { showPreview.toggle() } label: {
+                                Image(systemName: "sidebar.right")
+                                    .foregroundColor(showPreview ? themeManager.textColor : .secondary)
+                            }
+                            .buttonStyle(.plain)
+                            .help(L10n.text("Toggle Preview", "显示或隐藏预览"))
+                            .accessibilityLabel(showPreview ? L10n.text("Hide Preview", "隐藏预览") : L10n.text("Show Preview", "显示预览"))
+
+                            Text(showPreview ? compiler.compilationStatus : L10n.text("Preview off", "预览已关闭"))
                                 .font(.caption)
                                 .lineLimit(1)
                                 .help(compiler.compilationStatus)
@@ -339,7 +359,8 @@ Rectangle().fill(Color.gray.opacity(0.3)).frame(width: 1, height: 16)
         }
         .background(DocumentWindowGuard(edited: workspace.isDirty,
             canClose: confirmDiscard, onClose: { cancelCompilation(); compiler.cleanUp(); workspace.closeAll() },
-            onTerminate: { cancelCompilation(); compiler.cleanUp(waitForExit: true) }))
+            onTerminate: { workspace.closeAll(); cancelCompilation(); compiler.cleanUp(waitForExit: true) },
+            onCancelClose: { for tab in workspace.tabs { tab.suspendAutoSave(false) } }))
         .focusedSceneValue(\.documentActions, DocumentActions(open: openFile, save: saveFile, export: exportPDF, refresh: refreshPreview, insert: insertSnippet, hasDocument: selectedFile != nil))
         .alert(L10n.text("Operation failed", "操作失败"), isPresented: Binding(get: { operationError != nil }, set: { if !$0 { operationError = nil } })) {
             Button(L10n.text("OK", "确定")) { operationError = nil }
@@ -348,6 +369,20 @@ Rectangle().fill(Color.gray.opacity(0.3)).frame(width: 1, height: 16)
             guard newValue != loadedFile else { return }
             if let newValue { loadFile(url: newValue) }
         }
+        .onChange(of: showPreview) { enabled in
+            resetPreview()
+            if enabled { scheduleCompilation() }
+        }
+        .onChange(of: settings.autoSaveEnabled) { enabled in
+            for tab in workspace.tabs { tab.configureAutoSave(enabled) }
+        }
+        .task(id: gitRequestKey) {
+            do { try await Task.sleep(for: .milliseconds(400)) } catch { return }
+            while !Task.isCancelled {
+                await git.refresh(folder: fileSystem.currentFolder, tab: workspace.active)
+                do { try await Task.sleep(for: .seconds(4)) } catch { return }
+            }
+        }
         .onChange(of: settings.choice) { _ in refreshPreview() }
         .onChange(of: settings.customPath) { _ in refreshPreview() }
         .onChange(of: settings.lowMemoryMode) { _ in refreshPreview() }
@@ -355,12 +390,18 @@ Rectangle().fill(Color.gray.opacity(0.3)).frame(width: 1, height: 16)
         .onChange(of: settings.fontPaths) { _ in refreshPreview() }
         .onChange(of: settings.rootPath) { _ in refreshPreview() }
         .onDisappear { cancelCompilation(); compiler.cleanUp() }
+        .onReceive(NotificationCenter.default.publisher(for: .documentDidSave)) { notification in
+            guard let tab = notification.object as? DocumentTab, workspace.tabs.contains(where: { $0 === tab }) else { return }
+            gitRevision = UUID()
+            if workspace.active === tab { lastSaved = tab.lastSaved }
+        }
         .onReceive(NotificationCenter.default.publisher(for: .documentSourceDidChange)) { notification in
             guard let tab = notification.object as? DocumentTab, workspace.active === tab else { return }
+            gitRevision = UUID()
             scheduleCompilation()
         }
         .onReceive(NotificationCenter.default.publisher(for: .pdfDidUpdate)) { notification in
-            guard let sender = notification.object as? TypstCompiler, sender === compiler,
+            guard showPreview, let sender = notification.object as? TypstCompiler, sender === compiler,
                   let url = notification.userInfo?["url"] as? URL, compiler.previewURL == url,
                   let file = notification.userInfo?["file"] as? URL,
                   workspace.activeID == DocumentTab.identity(file) else { return }
@@ -383,12 +424,19 @@ Rectangle().fill(Color.gray.opacity(0.3)).frame(width: 1, height: 16)
 
     func confirmDiscard() -> Bool {
         commitActiveEditor()
-        for tab in workspace.tabs where !confirmDiscard(tab) { return false }
+        for tab in workspace.tabs { tab.suspendAutoSave(true) }
+        for tab in workspace.tabs where !confirmDiscard(tab) {
+            for tab in workspace.tabs { tab.suspendAutoSave(false) }
+            return false
+        }
         return true
     }
 
     func confirmDiscard(_ tab: DocumentTab) -> Bool {
         guard tab.isDirty else { return true }
+        tab.suspendAutoSave(true)
+        var allowed = false
+        defer { if !allowed { tab.suspendAutoSave(false) } }
         let alert = NSAlert()
         alert.messageText = L10n.text("Save changes to ", "保存修改：") + tab.url.lastPathComponent + "?"
         alert.addButton(withTitle: L10n.text("Save", "保存"))
@@ -396,9 +444,9 @@ Rectangle().fill(Color.gray.opacity(0.3)).frame(width: 1, height: 16)
         alert.addButton(withTitle: L10n.text("Discard", "放弃修改"))
         switch alert.runModal() {
         case .alertFirstButtonReturn:
-            do { try tab.save(); return true }
+            do { try tab.save(); allowed = true; return true }
             catch { operationError = error.localizedDescription; return false }
-        case .alertThirdButtonReturn: return true
+        case .alertThirdButtonReturn: allowed = true; return true
         default: return false
         }
     }
@@ -459,6 +507,7 @@ Rectangle().fill(Color.gray.opacity(0.3)).frame(width: 1, height: 16)
             let root = canonicalFolder.flatMap { canonicalFile.path.hasPrefix($0.path == "/" ? "/" : $0.path + "/") ? folder : nil }
                 ?? url.deletingLastPathComponent()
             let tab = try workspace.open(url, projectFolder: root)
+            tab.configureAutoSave(settings.autoSaveEnabled)
             if let line = pendingLine {
                 pendingLine = nil
                 tab.pendingLine = line
@@ -527,6 +576,7 @@ Rectangle().fill(Color.gray.opacity(0.3)).frame(width: 1, height: 16)
         guard let tab = workspace.active else { return }
         do {
             try tab.save()
+            gitRevision = UUID()
             RecentFilesManager.shared.add(url: tab.url)
             
             // Trigger compilation to generate PDF
@@ -546,6 +596,17 @@ Rectangle().fill(Color.gray.opacity(0.3)).frame(width: 1, height: 16)
         } catch {
             operationError = error.localizedDescription
         }
+    }
+
+    func saveSourceCopy() {
+        commitActiveEditor(endEditing: false)
+        guard let tab = workspace.active else { return }
+        let panel = NSSavePanel()
+        panel.nameFieldStringValue = tab.url.deletingPathExtension().lastPathComponent + "-copy.typ"
+        panel.directoryURL = tab.url.deletingLastPathComponent()
+        guard panel.runModal() == .OK, let destination = panel.url else { return }
+        do { try tab.source.write(to: destination, atomically: true, encoding: .utf8) }
+        catch { operationError = error.localizedDescription }
     }
     
     func exportPDF() {
@@ -601,7 +662,7 @@ Rectangle().fill(Color.gray.opacity(0.3)).frame(width: 1, height: 16)
 
     func scheduleCompilation() {
         cancelCompilation()
-        guard let tab = workspace.active else { return }
+        guard showPreview, let tab = workspace.active else { return }
         let request = compilationRequest
         let currentSource = tab.source
         let fileURL = tab.url

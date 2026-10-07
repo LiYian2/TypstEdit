@@ -37,6 +37,9 @@ struct TypstExecutableResolver {
 @MainActor
 final class CompilerSettings: ObservableObject {
     static let shared = CompilerSettings()
+    @Published var autoSaveEnabled: Bool {
+        didSet { defaults.set(autoSaveEnabled, forKey: "editorAutoSave") }
+    }
     @Published var choice: CompilerChoice {
         didSet { defaults.set(choice.rawValue, forKey: "compilerChoice") }
     }
@@ -63,6 +66,7 @@ final class CompilerSettings: ObservableObject {
 
     init(defaults: UserDefaults = .standard) {
         self.defaults = defaults
+        autoSaveEnabled = defaults.bool(forKey: "editorAutoSave")
         choice = CompilerChoice(rawValue: defaults.string(forKey: "compilerChoice") ?? "") ?? .automatic
         customPath = defaults.string(forKey: "compilerCustomPath") ?? ""
         rootPath = defaults.string(forKey: "compilerRootPath") ?? ""
@@ -176,14 +180,14 @@ enum CLIProcess {
         process.waitUntilExit()
     }
     /// Drain the pipe while running to avoid deadlock on large diagnostics. A watchdog bounds custom binaries.
-    static func run(executable: String, arguments: [String], directory: URL?, timeout: TimeInterval = 60) -> CLIResult {
+    static func run(executable: String, arguments: [String], directory: URL?, timeout: TimeInterval = 60, mergeStandardError: Bool = true) -> CLIResult {
         let process = Process()
         process.executableURL = URL(fileURLWithPath: executable)
         process.arguments = arguments
         process.currentDirectoryURL = directory
         let pipe = Pipe()
         process.standardOutput = pipe
-        process.standardError = pipe
+        process.standardError = mergeStandardError ? pipe : FileHandle.nullDevice
         do {
             try process.run()
             let watchdog = DispatchWorkItem { if process.isRunning { stopAndWait(process) } }

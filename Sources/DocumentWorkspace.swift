@@ -7,8 +7,12 @@ final class DocumentTab: ObservableObject, Identifiable {
     let url: URL
     let projectFolder: URL
     // Notify only after the canonical text changes: synchronous redraws must see the new text.
-    var source: String { didSet { if source != oldValue { objectWillChange.send() } } }
+    var source: String { didSet { if source != oldValue { objectWillChange.send(); scheduleAutoSave() } } }
     @Published private(set) var savedSource: String
+    @Published private(set) var autoSaveError: String?
+    private var autoSaveEnabled = false
+    private var autoSaveSuspended = false
+    private var autoSaveTask: Task<Void, Never>?
     let controller = EditorController()
     private var controllerObservation: AnyCancellable?
     var editor: EditorView.Session?
@@ -29,15 +33,62 @@ final class DocumentTab: ObservableObject, Identifiable {
     static func identity(_ url: URL) -> URL { url.resolvingSymlinksInPath().standardizedFileURL }
 
     func save() throws {
-        // Write through the canonical path so opening a symlink does not replace the link.
-        try source.write(to: id, atomically: true, encoding: .utf8)
-        savedSource = source
-        lastSaved = Date()
+        do {
+            // Refuse to silently replace edits made by another application.
+            guard try String(contentsOf: id, encoding: .utf8) == savedSource else { throw DocumentSaveError.externalChange }
+            // Write through the canonical path so opening a symlink does not replace the link.
+            try source.write(to: id, atomically: true, encoding: .utf8)
+            savedSource = source
+            lastSaved = Date()
+            autoSaveError = nil
+            autoSaveTask?.cancel()
+        } catch {
+            autoSaveError = error.localizedDescription
+            throw error
+        }
+    }
+
+    func configureAutoSave(_ enabled: Bool) {
+        autoSaveEnabled = enabled
+        autoSaveTask?.cancel()
+        if enabled { scheduleAutoSave() }
+    }
+
+    func suspendAutoSave(_ suspended: Bool) {
+        autoSaveSuspended = suspended
+        autoSaveTask?.cancel()
+        if !suspended { scheduleAutoSave() }
+    }
+
+    func scheduleAutoSave(delay: Duration = .seconds(1)) {
+        autoSaveTask?.cancel()
+        guard autoSaveEnabled, !autoSaveSuspended, isDirty, autoSaveError == nil else { return }
+        let revision = source
+        autoSaveTask = Task { @MainActor [weak self] in
+            do { try await Task.sleep(for: delay) } catch { return }
+            guard let self, self.autoSaveEnabled, !self.autoSaveSuspended, !Task.isCancelled, self.source == revision,
+                  self.editor?.textView.hasMarkedText() != true else { return }
+            do {
+                try self.save()
+                NotificationCenter.default.post(name: .documentDidSave, object: self)
+            } catch {
+                self.autoSaveError = error.localizedDescription
+            }
+        }
     }
 
     func dispose() {
+        configureAutoSave(false)
         editor?.detach()
         editor = nil
+    }
+}
+
+enum DocumentSaveError: LocalizedError {
+    case externalChange
+    var errorDescription: String? {
+        L10n.text("The file changed outside TypstEdit. Your draft is retained; reopen the file to review the disk version before saving.",
+                  "文件已在 TypstEdit 外修改。草稿已保留，请先核对磁盘版本再保存。")
     }
 }
 
@@ -80,4 +131,5 @@ final class DocumentWorkspace: ObservableObject {
 
 extension Notification.Name {
     static let documentSourceDidChange = Notification.Name("documentSourceDidChange")
+    static let documentDidSave = Notification.Name("documentDidSave")
 }

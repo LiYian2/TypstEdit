@@ -70,6 +70,15 @@ Each tab retains the project root selected when it was first opened. Reopening t
 
 Preview updates no longer overwrite a final PDF automatically. Compilation errors leave the editor editable, including Chinese IME input. Chinese/English UI follows the first macOS preferred language. The bilingual template uses `PingFang SC` with a Latin font fallback; PDF fonts/language remain under control of the Typst document.
 
+## Git, Preview and Auto Save
+
+- Git repositories show colored file badges, a branch/change list, and green/blue/red gutter marks for added/modified/deleted lines. Gutter comparisons include the current unsaved draft and staged changes relative to HEAD. The change list shows index/worktree status in two columns and can open changed `.typ` files; renames show both paths. Git is read-only here.
+- The **right sidebar button / 右侧预览按钮** hides or restores Preview. Hiding it expands the editor, cancels compilation, and releases the preview PDF/compiler; saving and PDF export still work. The choice persists.
+- Enable **Settings → Editing → Auto Save / 设置 → 编辑 → 自动保存** to save after one second without typing. It defaults to off. Each tab saves independently, including after compilation errors; provisional IME input is excluded. Closing prompts suspend pending saves, and cancelling resumes them.
+- If the disk file differs from the last saved version, saving pauses and retains the draft. Use **Save a Copy / 保存副本** to preserve it before reviewing the external version. No automatic retry loop or repeated alert.
+
+Git runs serially in the background, refreshes after a short typing debounce and every four seconds, and caches unchanged line diffs. Each command has a three-second timeout; obsolete results are discarded. No Git process stays resident. Homebrew Git or Apple's developer-tools Git is required; missing Git disables decorations without starting an installer. Ordinary folders require no Git installation. The change list displays up to 200 entries.
+
 ## Performance and memory
 
 The app and bundled CLI run natively on Apple Silicon. Typst uses its default available-CPU parallelism; the editor keeps one watcher for the active tab to retain incremental caches and observe imports. Typst compilation in this integration has no GPU or Neural Engine backend.

@@ -50,6 +50,9 @@ struct SettingsView: View {
                 }
             }
             Section(L10n.text("Editing", "编辑")) {
+                Toggle(L10n.text("Auto Save", "自动保存"), isOn: $settings.autoSaveEnabled)
+                Text(L10n.text("Save after 1 second without typing. Compilation errors do not prevent saving. External file changes pause saving and retain your draft.", "停止输入 1 秒后保存，编译错误不影响保存。检测到外部修改时暂停保存并保留草稿。"))
+                    .font(.caption).foregroundColor(.secondary)
                 Text(L10n.text("Interface follows your macOS language (Chinese or English). Chinese input uses the native input method. PDF fonts and language are controlled by your Typst document.", "界面跟随 macOS 语言（中文或英文），中文输入使用原生输入法。PDF 字体及语言由 Typst 文档设置。"))
                     .font(.caption).foregroundColor(.secondary)
             }

@@ -26,7 +26,163 @@ struct CompilerTests {
         try await testWatchSuccessErrorRecoveryAndCleanup()
         try await testLowMemoryPreviewReleasesCompiler()
         try await testRapidPreviewRequestsKeepLatestRevision()
-        print("PASS: 20 regression groups (previous 17 plus tab buffers/save failures, diagnostics during typing/IME, reused editors and independent undo)")
+        testGitStatusAndHunkParsing()
+        try await testGitRepositoryAndDraftDecorations()
+        try await testAutoSaveAndExternalChanges()
+        try await testTerminationCancellationResumesAutoSave()
+        print("PASS: 24 regression groups (compiler/editor/preview, tabs and undo, Git status/draft diffs, auto-save and external-change protection)")
+    }
+
+    static func testGitStatusAndHunkParsing() {
+        let (branch, changes) = GitSnapshot.parseStatus("## main...origin/main\0 M a.typ\0A  b.typ\0R  new name.typ\0old name.typ\0UU conflict.typ\0?? folder/\0?? odd\nname.typ\0?? .typstedit-preview-test.typ\0")
+        expectEqual(branch, "main...origin/main")
+        expectEqual(changes.count, 6)
+        expectEqual(changes.first { $0.path == "new name.typ" }?.kind, .renamed)
+        expectEqual(changes.first { $0.path == "new name.typ" }?.originalPath, "old name.typ")
+        for status in ["UU", "AA", "DU", "UD", "AU", "UA", "DD"] {
+            expectEqual(GitSnapshot.parseStatus(status + " conflict.typ\0").1.first?.kind, .conflicted)
+        }
+        expectTrue(GitSnapshot.parseStatus("R  truncated\0").1.isEmpty)
+        expectEqual(GitReader.logicalLines("A\r\nB\u{2028}C\u{2029}D\r"), "A\nB\nC\nD\n")
+        expectEqual(changes.first { $0.path == "conflict.typ" }?.kind, .conflicted)
+        expectTrue(changes.first { $0.path == "b.typ" }!.staged)
+        expectTrue(changes.first { $0.path == "a.typ" }!.unstaged)
+        expectEqual(changes.first { $0.path == "odd\nname.typ" }?.kind, .untracked)
+        let lines = GitSnapshot.parseHunks("@@ -1 +1,2 @@\n@@ -5,2 +6,0 @@\n@@ -8,0 +9,2 @@", lineCount: 10)
+        expectEqual(lines[1], .modified); expectEqual(lines[2], .modified)
+        expectEqual(lines[6], .deleted); expectEqual(lines[9], .added); expectEqual(lines[10], .added)
+        expectEqual(GitSnapshot.parseHunks("@@ -1 +0,0 @@", lineCount: 1)[1], .deleted)
+        let longAddition = GitSnapshot.parseHunks("@@ -0,0 +1,100000 @@", lineCount: 100000)
+        expectEqual(longAddition.segments.count, 1)
+        expectEqual(longAddition[100000], .added)
+    }
+
+    static func testGitRepositoryAndDraftDecorations() async throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent("TypstEdit git \(UUID())")
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        func git(_ arguments: [String]) {
+            let result = CLIProcess.run(executable: "/usr/bin/git", arguments: arguments, directory: root, timeout: 5)
+            expectEqual(result.status, 0)
+        }
+        git(["init", "-q"])
+        let file = root.appendingPathComponent("中 文.typ")
+        try "A\nB\nC\n".write(to: file, atomically: true, encoding: .utf8)
+        let reader = GitReader()
+        let unborn = await reader.snapshot(folder: root, file: file, source: "A\nB\nC\n")
+        expectEqual(unborn.changes.first?.kind, .untracked)
+        expectEqual(unborn.lines[1], .added)
+        git(["add", "--", file.lastPathComponent])
+        let stagedUnborn = await reader.snapshot(folder: root, file: file, source: "A\nB\nC\n")
+        expectEqual(stagedUnborn.lines[1], .added)
+        git(["config", "color.ui", "always"])
+        git(["-c", "user.name=Regression", "-c", "user.email=regression@example.invalid", "-c", "commit.gpgsign=false", "commit", "-qm", "fixture"])
+        let draft = await reader.snapshot(folder: root, file: file, source: "A\nchanged\nC\nnew\n")
+        expectTrue(draft.changes.isEmpty) // Unsaved edits do not mutate the index/worktree.
+        expectEqual(draft.lines[2], .modified); expectEqual(draft.lines[4], .added)
+        expectEqual(try String(contentsOf: file, encoding: .utf8), "A\nB\nC\n")
+        try "A\nchanged\nC\n".write(to: file, atomically: true, encoding: .utf8)
+        let modified = await reader.snapshot(folder: root, file: file, source: "A\nchanged\nC\n")
+        expectEqual(modified.changes.first?.kind, .modified)
+        git(["add", "--", file.lastPathComponent])
+        let staged = await reader.snapshot(folder: root, file: file, source: "A\nchanged\nC\n")
+        expectTrue(staged.changes.first!.staged)
+        expectEqual(staged.lines[2], .modified) // Compare with HEAD, including staged changes.
+        let binary = await reader.snapshot(folder: root, file: file, source: "A\0B")
+        expectTrue(binary.lines.isEmpty)
+        let unicodeLines = await reader.snapshot(folder: root, file: file, source: "A\u{2028}different\u{2028}C\n")
+        expectEqual(unicodeLines.lines[2], .modified)
+        git(["restore", "--source=HEAD", "--staged", "--worktree", "--", file.lastPathComponent])
+        git(["mv", "--", file.lastPathComponent, "renamed.typ"])
+        let rename = await reader.snapshot(folder: root, file: root.appendingPathComponent("renamed.typ"), source: "A\nB\nC\n")
+        expectEqual(rename.changes.first?.kind, .renamed)
+        expectEqual(rename.changes.first?.originalPath, file.lastPathComponent)
+        expectTrue(rename.lines.isEmpty)
+        let plain = FileManager.default.temporaryDirectory.appendingPathComponent("TypstEdit no git \(UUID())")
+        try FileManager.default.createDirectory(at: plain, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: plain) }
+        expectNil(await reader.snapshot(folder: plain, file: nil, source: nil).root)
+        git(["worktree", "add", "--detach", root.appendingPathComponent("linked").path, "HEAD"])
+        let linked = root.appendingPathComponent("linked")
+        let worktree = await reader.snapshot(folder: linked, file: linked.appendingPathComponent(file.lastPathComponent), source: "draft\n")
+        expectEqual(worktree.root, linked.resolvingSymlinksInPath())
+        expectEqual(worktree.lines[1], .modified)
+    }
+
+    @MainActor
+    static func testAutoSaveAndExternalChanges() async throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent("TypstEdit auto \(UUID())")
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        func tab(_ name: String) throws -> DocumentTab {
+            let file = root.appendingPathComponent(name + ".typ")
+            try "saved".write(to: file, atomically: true, encoding: .utf8)
+            return DocumentTab(url: file, projectFolder: root, source: "saved")
+        }
+        let a = try tab("a"), b = try tab("b")
+        a.configureAutoSave(true); b.configureAutoSave(true)
+        a.source = "stale"; a.scheduleAutoSave(delay: .milliseconds(30))
+        a.source = "latest"; a.scheduleAutoSave(delay: .milliseconds(50))
+        b.source = "B"; b.scheduleAutoSave(delay: .milliseconds(30))
+        try await Task.sleep(for: .milliseconds(120))
+        expectEqual(try String(contentsOf: a.id, encoding: .utf8), "latest")
+        expectEqual(try String(contentsOf: b.id, encoding: .utf8), "B")
+        expectFalse(a.isDirty); expectFalse(b.isDirty)
+        a.source = "suspended"; a.scheduleAutoSave(delay: .milliseconds(30)); a.suspendAutoSave(true)
+        try await Task.sleep(for: .milliseconds(70))
+        expectEqual(try String(contentsOf: a.id, encoding: .utf8), "latest")
+        a.suspendAutoSave(false); a.scheduleAutoSave(delay: .milliseconds(30))
+        try await Task.sleep(for: .milliseconds(70))
+        expectEqual(try String(contentsOf: a.id, encoding: .utf8), "suspended")
+        a.source = "discarded"; a.scheduleAutoSave(delay: .milliseconds(30)); a.dispose()
+        try await Task.sleep(for: .milliseconds(70))
+        expectEqual(try String(contentsOf: a.id, encoding: .utf8), "suspended")
+        try "external".write(to: b.id, atomically: true, encoding: .utf8)
+        b.source = "draft"; b.scheduleAutoSave(delay: .milliseconds(30))
+        try await Task.sleep(for: .milliseconds(70))
+        expectTrue(b.isDirty); expectTrue(b.autoSaveError != nil)
+        expectEqual(try String(contentsOf: b.id, encoding: .utf8), "external")
+        expectThrows(try b.save())
+        b.dispose()
+        let c = try tab("ime")
+        let session = EditorView(text: .constant(c.source), controller: c.controller, onCommit: {}, document: c).makeSession()
+        session.synchronizeText(); c.configureAutoSave(true)
+        c.source = "committed draft"; c.scheduleAutoSave(delay: .milliseconds(30))
+        session.textView.setMarkedText("ni", selectedRange: NSRange(location: 2, length: 0), replacementRange: NSRange(location: 5, length: 0))
+        try await Task.sleep(for: .milliseconds(70))
+        expectEqual(try String(contentsOf: c.id, encoding: .utf8), "saved")
+        session.textView.insertText("你", replacementRange: session.textView.markedRange())
+        session.commitCurrentText(); c.scheduleAutoSave(delay: .milliseconds(30))
+        try await Task.sleep(for: .milliseconds(70))
+        expectEqual(try String(contentsOf: c.id, encoding: .utf8), c.source)
+        c.source += " draft"
+        session.synchronizeText()
+        let end = session.textView.string.utf16.count
+        session.textView.setMarkedText("ni", selectedRange: NSRange(location: 2, length: 0), replacementRange: NSRange(location: end, length: 0))
+        c.scheduleAutoSave(delay: .milliseconds(30))
+        try await Task.sleep(for: .milliseconds(70))
+        session.textView.insertText("", replacementRange: session.textView.markedRange())
+        session.commitCurrentText()
+        try await Task.sleep(for: .milliseconds(1100))
+        expectEqual(try String(contentsOf: c.id, encoding: .utf8), c.source)
+        c.dispose()
+    }
+
+    @MainActor
+    static func testTerminationCancellationResumesAutoSave() async throws {
+        let file = FileManager.default.temporaryDirectory.appendingPathComponent("TypstEdit quit \(UUID()).typ")
+        try "saved".write(to: file, atomically: true, encoding: .utf8)
+        defer { try? FileManager.default.removeItem(at: file) }
+        let tab = DocumentTab(url: file, projectFolder: file.deletingLastPathComponent(), source: "saved")
+        tab.configureAutoSave(true); tab.suspendAutoSave(true); tab.source = "retained draft"
+        let checks = ApplicationDelegate.closeChecks, resumes = ApplicationDelegate.closeCancellations
+        defer { ApplicationDelegate.closeChecks = checks; ApplicationDelegate.closeCancellations = resumes; tab.dispose() }
+        ApplicationDelegate.closeChecks = [UUID(): { false }]
+        ApplicationDelegate.closeCancellations = [UUID(): { tab.suspendAutoSave(false) }]
+        expectEqual(ApplicationDelegate().applicationShouldTerminate(NSApplication.shared), .terminateCancel)
+        tab.scheduleAutoSave(delay: .milliseconds(30))
+        try await Task.sleep(for: .milliseconds(70))
+        expectEqual(try String(contentsOf: file, encoding: .utf8), "retained draft")
     }
 
     static func testExecutablePriorityAndInvalidCustomDoNotSilentlyFallback() {

@@ -31,13 +31,65 @@ struct CompilerTests {
         try await testRealTinymistAssistance()
         try await testFormattingUndoAndSave()
         try await testDelayedFormattingNeverOverwritesDraftOrDiscard()
+        try await testHoverReadingAndMarkdown()
         testGitHunkDetailsAndPatch()
         try await testGitFileHistory()
         testGitStatusAndHunkParsing()
         try await testGitRepositoryAndDraftDecorations()
         try await testAutoSaveAndExternalChanges()
         try await testTerminationCancellationResumesAutoSave()
-        print("PASS: 31 regression groups (compiler/editor/preview, tabs and undo, Git review, LSP assistance/formatting, auto-save and external-change protection)")
+        print("PASS: 32 regression groups (compiler/editor/preview, tabs and undo, Git review, LSP assistance/formatting/hover reading, auto-save and external-change protection)")
+    }
+
+    @MainActor
+    static func testHoverReadingAndMarkdown() async throws {
+        let source = "# Heading\r\n\r\n**Bold** and `code` [link](https://example.com)\r\n- item\r\n```typst\r\n#let x = \"**literal**\"\r\n```\r\n> quote"
+        let rendered = HoverMarkdown(source)
+        expectEqual(rendered.blocks.map(\.kind), [.heading(1), .paragraph, .list, .code, .quote])
+        expectTrue(rendered.blocks[1].inline.runs.contains { $0.inlinePresentationIntent?.contains(.stronglyEmphasized) == true })
+        expectTrue(rendered.blocks[1].inline.runs.contains { $0.inlinePresentationIntent?.contains(.code) == true })
+        expectTrue(rendered.blocks.allSatisfy { $0.inline.runs.allSatisfy { $0.link == nil } })
+        expectEqual(rendered.blocks[3].text, "#let x = \"**literal**\"")
+        expectEqual(HoverMarkdown("```\n**raw**").blocks.first?.kind, .code)
+        expectEqual(HoverMarkdown("**plain**", markdown: false).blocks.first?.text, "**plain**")
+        let limited = HoverMarkdown(String(repeating: "- **item**\n", count: 2000))
+        expectTrue(limited.truncated); expectTrue(limited.blocks.count <= 120)
+        expectEqual(LanguageCompletion.documentation(Array(repeating: String(repeating: "x", count: 10000), count: 100)).count, 10000)
+
+        let editor = EditorView(text: .constant("#emph[hello]"), controller: EditorController(), onCommit: {}).makeSession()
+        let popup = NSPopover(), token = UUID()
+        editor.hoverPopover = popup; editor.hoverToken = token
+        editor.deferHoverClose() // Leave the editor, cross the gap, then enter the popup.
+        try await Task.sleep(for: .milliseconds(100))
+        editor.hoverPointerChanged(true, token: token)
+        try await Task.sleep(for: .milliseconds(450))
+        expectTrue(editor.hoverPopover === popup)
+        editor.hoverPointerChanged(false, token: UUID()) // Late callback from an old popup.
+        expectNil(editor.hoverCloseTask)
+        editor.hoverPointerChanged(false, token: token)
+        try await Task.sleep(for: .milliseconds(450))
+        expectNil(editor.hoverPopover); expectNil(editor.hoverCloseTask)
+        editor.hoverPopover = NSPopover(); editor.deferHoverClose(); editor.detach()
+        expectNil(editor.hoverPopover); expectNil(editor.hoverCloseTask)
+        editor.hoverPopover = NSPopover()
+        NotificationCenter.default.post(name: NSView.boundsDidChangeNotification, object: editor.scrollView.contentView)
+        expectNil(editor.hoverPopover)
+        for _ in 0..<100 {
+            weak var released: NSViewController?
+            autoreleasepool {
+                let popup = NSPopover()
+                popup.contentViewController = NSHostingController(rootView: LanguageHoverView(document: rendered, pointerChanged: { _ in }))
+                released = popup.contentViewController
+                editor.hoverPopover = popup; editor.closeHover()
+            }
+            expectNil(released)
+        }
+
+        // Report parsing cost only; this does not measure full popup layout or app RSS.
+        let sample = Array(repeating: source, count: 16).joined(separator: "\n\n")
+        let start = Date()
+        for _ in 0..<100 { autoreleasepool { _ = HoverMarkdown(sample) } }
+        print(String(format: "Markdown parse: %.3f ms/document (%d UTF-8 bytes, 100 iterations)", Date().timeIntervalSince(start) * 10, sample.utf8.count))
     }
 
     static func testLanguagePositionsEditsSnippetsAndFraming() throws {

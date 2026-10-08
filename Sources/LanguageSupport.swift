@@ -157,10 +157,25 @@ struct LanguageCompletion: Sendable {
         }
     }
     static func documentation(_ value: Any?) -> String {
-        if let string = value as? String { return String(string.prefix(10000)) }
-        if let markup = value as? [String: Any] { return String((markup["value"] as? String ?? "").prefix(10000)) }
-        if let values = value as? [Any] { return String(values.map { documentation($0) }.joined(separator: "\n\n").prefix(10000)) }
-        return ""
+        var result = "", remaining = 10000
+        func append(_ text: String) {
+            guard remaining > 0 else { return }
+            let part = String(text.prefix(remaining)); result += part; remaining -= part.count
+        }
+        func collect(_ value: Any?, depth: Int) {
+            guard remaining > 0, depth < 8 else { return }
+            if let string = value as? String { append(string) }
+            else if let markup = value as? [String: Any] { append(markup["value"] as? String ?? "") }
+            else if let values = value as? [Any] {
+                for value in values {
+                    guard remaining > 0 else { break }
+                    if !result.isEmpty { append("\n\n") }
+                    collect(value, depth: depth + 1)
+                }
+            }
+        }
+        collect(value, depth: 0)
+        return result
     }
 }
 

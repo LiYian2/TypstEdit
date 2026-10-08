@@ -117,11 +117,14 @@ struct EditorView: NSViewRepresentable {
         let documentUndoManager = UndoManager()
         var completionTask: Task<Void, Never>?
         var hoverTask: Task<Void, Never>?
+        var hoverCloseTask: Task<Void, Never>?
         var completionPopover: NSPopover?
         var hoverPopover: NSPopover?
         var completionModel: CompletionPresentation?
         var completionEventMonitor: Any?
         var completionInactiveObserver: NSObjectProtocol?
+        var hoverEventMonitor: Any?
+        var hoverInactiveObserver: NSObjectProtocol?
         var completionToken = UUID()
         var hoverToken = UUID()
         var hoverRange: NSRange?
@@ -164,6 +167,7 @@ struct EditorView: NSViewRepresentable {
             scrollObserver = NotificationCenter.default.addObserver(forName: NSView.boundsDidChangeNotification,
                 object: scrollView.contentView, queue: .main) { [weak self] _ in
                 MainActor.assumeIsolated {
+                    self?.closeHover()
                     self?.ruler.needsDisplay = true
                     if let self { self.highlighter.renderVisible(in: self.textView) }
                 }
@@ -196,9 +200,11 @@ struct EditorView: NSViewRepresentable {
         }
 
         deinit {
-            completionTask?.cancel(); hoverTask?.cancel()
+            completionTask?.cancel(); hoverTask?.cancel(); hoverCloseTask?.cancel()
             if let completionEventMonitor { NSEvent.removeMonitor(completionEventMonitor) }
             if let completionInactiveObserver { NotificationCenter.default.removeObserver(completionInactiveObserver) }
+            if let hoverEventMonitor { NSEvent.removeMonitor(hoverEventMonitor) }
+            if let hoverInactiveObserver { NotificationCenter.default.removeObserver(hoverInactiveObserver) }
             highlightTask?.cancel()
             tokenTask?.cancel()
             tokenizer?.cancel()

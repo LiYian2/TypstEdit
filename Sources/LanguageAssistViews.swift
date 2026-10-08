@@ -59,14 +59,85 @@ struct CompletionListView: View {
     }
 }
 
+struct HoverMarkdown {
+    enum Kind: Equatable { case paragraph, heading(Int), code, list, quote, divider }
+    struct Block {
+        let kind: Kind
+        let text: String
+        let inline: AttributedString
+        init(_ kind: Kind, _ text: String) {
+            self.kind = kind; self.text = text
+            var inline = kind == .code ? AttributedString(text) : (try? AttributedString(markdown: text,
+                options: .init(interpretedSyntax: .inlineOnlyPreservingWhitespace))) ?? AttributedString(text)
+            for run in inline.runs {
+                // No remote images or automatic navigation. Code uses a native monospace font.
+                inline[run.range].link = nil
+                if run.inlinePresentationIntent?.contains(.code) == true { inline[run.range].font = .system(size: 12, design: .monospaced) }
+            }
+            self.inline = inline
+        }
+    }
+    let blocks: [Block]
+    let truncated: Bool
+    init(_ source: String, markdown: Bool = true) {
+        let text = String(source.prefix(10000))
+        let oversized = !source.dropFirst(10000).isEmpty
+        if !markdown { blocks = [Block(.code, text)]; truncated = oversized; return }
+        var result: [Block] = [], paragraph: [String] = [], code: [String] = [], fence: String?
+        func flush() {
+            if !paragraph.isEmpty { result.append(Block(.paragraph, paragraph.joined(separator: "\n"))); paragraph.removeAll() }
+        }
+        var didTruncate = oversized
+        for line in text.replacingOccurrences(of: "\r\n", with: "\n").replacingOccurrences(of: "\r", with: "\n").components(separatedBy: "\n") {
+            if result.count >= 120 { didTruncate = true; break }
+            let trimmed = line.trimmingCharacters(in: .whitespaces)
+            if let marker = fence {
+                if trimmed.hasPrefix(marker) { result.append(Block(.code, code.joined(separator: "\n"))); code.removeAll(); fence = nil }
+                else { code.append(line) }
+                continue
+            }
+            if trimmed.hasPrefix("```") || trimmed.hasPrefix("~~~") { flush(); fence = String(trimmed.prefix(3)); continue }
+            if trimmed.isEmpty { flush(); continue }
+            let level = trimmed.prefix(while: { $0 == "#" }).count
+            if (1...6).contains(level), trimmed.dropFirst(level).hasPrefix(" ") {
+                flush(); result.append(Block(.heading(level), String(trimmed.dropFirst(level + 1)))); continue
+            }
+            if ["---", "***", "___"].contains(trimmed) { flush(); result.append(Block(.divider, "")); continue }
+            if trimmed.hasPrefix("> ") { flush(); result.append(Block(.quote, String(trimmed.dropFirst(2)))); continue }
+            if ["- ", "* ", "+ "].contains(where: trimmed.hasPrefix) {
+                flush(); result.append(Block(.list, "• " + trimmed.dropFirst(2))); continue
+            }
+            if trimmed.range(of: #"^\d+[.)]\s+"#, options: .regularExpression) != nil { flush(); result.append(Block(.list, trimmed)); continue }
+            paragraph.append(line)
+        }
+        flush()
+        if fence != nil { result.append(Block(.code, code.joined(separator: "\n"))) }
+        blocks = Array(result.prefix(120)); truncated = didTruncate || result.count > 120
+    }
+}
+
 struct LanguageHoverView: View {
-    let text: String
+    let document: HoverMarkdown
+    let pointerChanged: (Bool) -> Void
     var body: some View {
         ScrollView {
-            // Render server documentation as inert text; no remote HTML, commands or automatic links.
-            Text(text).font(.system(size: 12, design: .monospaced)).textSelection(.enabled)
-                .frame(maxWidth: .infinity, alignment: .leading).padding(12)
-        }.frame(width: 520, height: 260).preferredColorScheme(.dark)
+            VStack(alignment: .leading, spacing: 8) {
+                ForEach(document.blocks.indices, id: \.self) { index in
+                    let block = document.blocks[index]
+                    switch block.kind {
+                    case .divider: Divider()
+                    case .heading(let level): Text(block.inline).font(.system(size: CGFloat(max(14, 20 - level)), weight: .semibold))
+                    case .code:
+                        Text(block.text).font(.system(size: 12, design: .monospaced)).frame(maxWidth: .infinity, alignment: .leading)
+                            .padding(8).background(Color.white.opacity(0.06)).cornerRadius(4)
+                    case .quote: Text(block.inline).font(.system(size: 13)).foregroundColor(.secondary).padding(.leading, 8)
+                    case .list: Text(block.inline).font(.system(size: 13)).padding(.leading, 8)
+                    case .paragraph: Text(block.inline).font(.system(size: 13))
+                    }
+                }
+                if document.truncated { Text(L10n.text("Documentation truncated", "说明内容已截断")).font(.caption).foregroundColor(.secondary) }
+            }.textSelection(.enabled).frame(maxWidth: .infinity, alignment: .leading).padding(12)
+        }.frame(width: 520, height: 260).contentShape(Rectangle()).onHover(perform: pointerChanged).preferredColorScheme(.dark)
     }
 }
 
@@ -76,7 +147,7 @@ extension EditorView.Session {
         view.requestCompletion = { [weak self] in self?.complete(explicit: true) }
         view.assistKey = { [weak self] event in self?.handleAssistKey(event) ?? false }
         view.hoverMoved = { [weak self] position in self?.scheduleHover(at: position) }
-        view.hoverExited = { [weak self] in self?.closeHover() }
+        view.hoverExited = { [weak self] in self?.deferHoverClose() }
     }
 
     func dismissAssistance() {
@@ -88,8 +159,71 @@ extension EditorView.Session {
         closeHover()
     }
     func closeHover() {
+        hoverCloseTask?.cancel(); hoverCloseTask = nil
         hoverTask?.cancel(); hoverTask = nil; hoverRange = nil
-        hoverPopover?.close(); hoverPopover?.contentViewController = nil; hoverPopover = nil
+        hoverToken = UUID()
+        if let hoverEventMonitor { NSEvent.removeMonitor(hoverEventMonitor); self.hoverEventMonitor = nil }
+        if let hoverInactiveObserver { NotificationCenter.default.removeObserver(hoverInactiveObserver); self.hoverInactiveObserver = nil }
+        let old = hoverPopover; hoverPopover = nil
+        old?.close(); old?.contentViewController = nil
+    }
+    func hoverPointerChanged(_ inside: Bool, token: UUID) {
+        guard hoverToken == token, hoverPopover != nil else { return }
+        if inside { hoverCloseTask?.cancel(); hoverCloseTask = nil }
+        else { deferHoverClose() }
+    }
+    func deferHoverClose() {
+        guard hoverPopover != nil else { closeHover(); return }
+        hoverCloseTask?.cancel()
+        let token = hoverToken
+        hoverCloseTask = Task { @MainActor [weak self] in
+            do { try await Task.sleep(for: .milliseconds(350)) } catch { return }
+            guard let self, !Task.isCancelled, self.hoverToken == token else { return }
+            self.hoverCloseTask = nil
+            // Cover the gap/arrow between the symbol and popup, including focus changes while selecting text.
+            if let window = self.hoverPopover?.contentViewController?.view.window,
+               window.frame.insetBy(dx: -3, dy: -3).contains(NSEvent.mouseLocation) { return }
+            if let word = self.hoverRange, let window = self.textView.window,
+               let layout = self.textView.layoutManager, let container = self.textView.textContainer,
+               NSMaxRange(word) <= (self.textView.string as NSString).length {
+                let glyphs = layout.glyphRange(forCharacterRange: word, actualCharacterRange: nil)
+                let rect = layout.boundingRect(forGlyphRange: glyphs, in: container).offsetBy(dx: self.textView.textContainerOrigin.x, dy: self.textView.textContainerOrigin.y)
+                let point = self.textView.convert(window.convertPoint(fromScreen: NSEvent.mouseLocation), from: nil)
+                if self.textView.visibleRect.contains(point), rect.insetBy(dx: -3, dy: -3).contains(point) { return }
+            }
+            self.closeHover()
+            if let window = self.textView.window, window.isKeyWindow {
+                let point = self.textView.convert(window.convertPoint(fromScreen: NSEvent.mouseLocation), from: nil)
+                if self.textView.visibleRect.contains(point) {
+                    self.scheduleHover(at: self.textView.characterIndexForInsertion(at: point))
+                }
+            }
+        }
+    }
+    func monitorHoverInteraction() {
+        hoverEventMonitor = NSEvent.addLocalMonitorForEvents(matching: [.keyDown, .leftMouseDown, .rightMouseDown, .scrollWheel]) { [weak self] event in
+            guard let self, let popup = self.hoverPopover?.contentViewController?.view.window else { return event }
+            if event.type == .keyDown, event.keyCode == 53, (event.window === popup || event.window === self.textView.window) {
+                self.closeHover(); return nil
+            }
+            if event.type != .keyDown, event.window !== popup { self.closeHover() }
+            return event
+        }
+        observeHoverInactivity()
+    }
+    func observeHoverInactivity() {
+        guard hoverInactiveObserver == nil else { return }
+        hoverInactiveObserver = NotificationCenter.default.addObserver(forName: NSApplication.didResignActiveNotification, object: nil, queue: .main) { [weak self] _ in
+            MainActor.assumeIsolated { self?.closeHover() }
+        }
+    }
+    func presentHover(_ document: HoverMarkdown, at offset: Int, token: UUID) {
+        guard hoverToken == token, let rect = anchorRect(offset) else { return }
+        let popover = NSPopover(); popover.animates = false; popover.behavior = .applicationDefined
+        popover.contentSize = NSSize(width: 520, height: 260)
+        popover.contentViewController = NSHostingController(rootView: LanguageHoverView(document: document, pointerChanged: { [weak self] inside in self?.hoverPointerChanged(inside, token: token) }))
+        hoverPopover = popover; popover.show(relativeTo: rect, of: textView, preferredEdge: .maxY)
+        monitorHoverInteraction()
     }
     func completionPrefix() -> NSRange? {
         let selection = textView.selectedRange(), source = textView.string as NSString
@@ -238,25 +372,27 @@ extension EditorView.Session {
               let document = parent?.document, !textView.hasMarkedText(), textView.window?.isKeyWindow == true else { closeHover(); return }
         let source = textView.string as NSString
         guard offset < source.length, offset >= 0, let scalar = UnicodeScalar(source.character(at: offset)),
-              CharacterSet.alphanumerics.union(CharacterSet(charactersIn: "_-.")).contains(scalar) else { closeHover(); return }
+              CharacterSet.alphanumerics.union(CharacterSet(charactersIn: "_-.")).contains(scalar) else { deferHoverClose(); return }
         let word = textView.selectionRange(forProposedRange: NSRange(location: offset, length: 0), granularity: .selectByWord)
-        if hoverRange == word { return }
+        if hoverRange == word { hoverCloseTask?.cancel(); hoverCloseTask = nil; return }
+        if hoverPopover != nil { deferHoverClose(); return }
         closeHover(); hoverRange = word
         let currentRevision = revision, token = UUID(); hoverToken = token
         guard let context = try? LanguageSettings.shared.context(for: document), context.source == textView.string else { return }
+        observeHoverInactivity()
         hoverTask = Task { @MainActor [weak self] in
+            defer { if let self, self.hoverToken == token, self.hoverPopover == nil { self.closeHover() } }
             do {
                 try await Task.sleep(for: .milliseconds(450))
                 let response = try await TypstLanguageService.shared.request("textDocument/hover", document: context, position: offset)
                 let contents = LanguageCompletion.documentation((response as? [String: Any])?["contents"])
+                let raw = (response as? [String: Any])?["contents"]
+                let markdown = (raw as? [String: Any])?["kind"] as? String != "plaintext"
                 guard let self, !Task.isCancelled, self.hoverToken == token, self.parent?.document === document,
                       self.revision == currentRevision, self.hoverRange == word, self.textView.string == context.source,
                       !self.textView.hasMarkedText(), self.textView.window?.isKeyWindow == true,
-                      LanguageSettings.shared.enabled, LanguageSettings.shared.hover, !contents.isEmpty, let rect = self.anchorRect(offset) else { return }
-                let popover = NSPopover(); popover.animates = false; popover.behavior = .transient
-                popover.contentSize = NSSize(width: 520, height: 260)
-                popover.contentViewController = NSHostingController(rootView: LanguageHoverView(text: contents))
-                self.hoverPopover = popover; popover.show(relativeTo: rect, of: self.textView, preferredEdge: .maxY)
+                      LanguageSettings.shared.enabled, LanguageSettings.shared.hover, !contents.isEmpty else { return }
+                self.presentHover(HoverMarkdown(contents, markdown: markdown), at: offset, token: token)
             } catch { /* Hover is optional and never interrupts typing. */ }
         }
     }

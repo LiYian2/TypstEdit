@@ -81,6 +81,17 @@ Preview updates no longer overwrite a final PDF automatically. Compilation error
 
 Git runs serially in the background, refreshes after a short typing debounce and every four seconds, and caches unchanged line diffs. Each command has a three-second timeout; obsolete results are discarded. No Git process stays resident. Homebrew Git or Apple's developer-tools Git is required; missing Git disables decorations without starting an installer. Ordinary folders require no Git installation. The change list displays up to 200 entries. Review queries retain at most 4 MiB of output; hunk previews show up to 200 lines per side, commit previews up to 1,000 lines and displayed lines up to 4,000 characters. Larger previews show a truncation notice.
 
+## Typst language assistance
+
+Completion, hover documentation and document formatting use the optional [Tinymist language server](https://github.com/Myriad-Dreamin/tinymist). Install it with `brew install tinymist`, or choose an existing executable in **Settings → Language Assistance / 设置 → 语言辅助**. PATH, Homebrew and Cargo locations are detected automatically. Tinymist is not bundled; editing, preview and export work without it. Its embedded Typst version is independent of the PDF compiler selected in Settings.
+
+- Completion appears while typing Typst expressions. Use **⌥Esc** to request it anywhere; **↑/↓**, **Return/Tab** and **Esc** select, insert and dismiss. Common snippets expand and select their first placeholder; full snippet tab-stop navigation is not implemented.
+- Pause the pointer over a symbol to view its documentation. The popup displays selectable text.
+- **⇧⌥F**, the Edit menu or the format toolbar button formats the document using Tinymist's embedded Typstyle. Formatting is one undoable edit and preserves the selection. It never writes the file by itself.
+- Optional **Format on Save / 保存时格式化** applies to **⌘S** and Auto Save. A formatter failure saves the original draft with a status message. New input cancels outdated formatting. The close-confirmation Save action saves the draft immediately without waiting for formatting.
+
+The language server starts on demand, shares one process, retains one requested editor snapshot and exits after 60 seconds without requests. Imported files are read from disk. Disable language assistance to release the process. Semantic features consume additional memory while active; they do not require Electron, AI services or a separate formatting executable.
+
 ## Performance and memory
 
 The app and bundled CLI run natively on Apple Silicon. Typst uses its default available-CPU parallelism; the editor keeps one watcher for the active tab to retain incremental caches and observe imports. Typst compilation in this integration has no GPU or Neural Engine backend.

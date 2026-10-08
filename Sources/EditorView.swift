@@ -24,6 +24,7 @@ struct EditorView: NSViewRepresentable {
         textView.textColor = NSColor(themeManager.textColor)
         textView.insertionPointColor = NSColor(themeManager.textColor)
         host.appearance = NSAppearance(named: .darkAqua)
+        controller.document = document
         controller.textView = textView
         session.synchronizeText()
         session.ruler.errors = Set(controller.errors.filter { $0.line > 0 }.map(\.line))
@@ -114,6 +115,17 @@ struct EditorView: NSViewRepresentable {
         var tokenTask: Task<Void, Never>?
         var tokenizer: Task<[SyntaxHighlighter.Span], Never>?
         let documentUndoManager = UndoManager()
+        var completionTask: Task<Void, Never>?
+        var hoverTask: Task<Void, Never>?
+        var completionPopover: NSPopover?
+        var hoverPopover: NSPopover?
+        var completionModel: CompletionPresentation?
+        var completionEventMonitor: Any?
+        var completionInactiveObserver: NSObjectProtocol?
+        var completionToken = UUID()
+        var hoverToken = UUID()
+        var hoverRange: NSRange?
+        var isApplyingAssistance = false
         var revision = 0
         private var nativeEditPending = false
         private var isSynchronizing = false
@@ -129,7 +141,7 @@ struct EditorView: NSViewRepresentable {
             self.textContainer.widthTracksTextView = true
             self.layoutManager.addTextContainer(textContainer)
             
-            self.textView = NSTextView(frame: .zero, textContainer: textContainer)
+            self.textView = AssistTextView(frame: .zero, textContainer: textContainer)
             self.scrollView = NSScrollView()
             self.ruler = LineNumberRulerView(scrollView: scrollView, orientation: .verticalRuler)
             
@@ -179,10 +191,14 @@ struct EditorView: NSViewRepresentable {
             
             textView.delegate = self
             textStorage.delegate = self
+            configureAssistance()
 
         }
 
         deinit {
+            completionTask?.cancel(); hoverTask?.cancel()
+            if let completionEventMonitor { NSEvent.removeMonitor(completionEventMonitor) }
+            if let completionInactiveObserver { NotificationCenter.default.removeObserver(completionInactiveObserver) }
             highlightTask?.cancel()
             tokenTask?.cancel()
             tokenizer?.cancel()
@@ -198,6 +214,17 @@ struct EditorView: NSViewRepresentable {
             highlighter.invalidate()
             commitCurrentText()
             scheduleHighlighting()
+            if !isApplyingAssistance {
+                let token = revision
+                DispatchQueue.main.async { [weak self] in
+                    guard let self, self.revision == token else { return }
+                    self.complete(explicit: false)
+                }
+            }
+        }
+
+        func textViewDidChangeSelection(_ notification: Notification) {
+            dismissAssistance()
         }
 
         func commitCurrentText() {
@@ -217,7 +244,9 @@ struct EditorView: NSViewRepresentable {
         }
 
         func detach() {
+            dismissAssistance()
             parent?.controller.closeGitReview()
+            parent?.controller.cancelFormatting()
             highlightTask?.cancel()
             tokenTask?.cancel()
             tokenizer?.cancel()
@@ -227,6 +256,8 @@ struct EditorView: NSViewRepresentable {
         func textStorage(_ storage: NSTextStorage, didProcessEditing editedMask: NSTextStorageEditActions,
                          range editedRange: NSRange, changeInLength delta: Int) {
             guard editedMask.contains(.editedCharacters) else { return }
+            dismissAssistance()
+            parent?.document?.cancelLanguageOperation()
             if !isSynchronizing { nativeEditPending = true }
             revision &+= 1
             highlightTask?.cancel()

@@ -3,6 +3,10 @@ import AppKit
 
 @MainActor
 class EditorController: NSObject, ObservableObject, NSPopoverDelegate {
+    @Published var languageStatus = ""
+    @Published private(set) var isFormatting = false
+    private var formatTask: Task<Void, Never>?
+    weak var document: DocumentTab?
     @Published var errors: [TypstError] = [] { didSet { needsRedraw() } }
     var gitRoot: URL?
     var gitFile: URL?
@@ -71,6 +75,20 @@ class EditorController: NSObject, ObservableObject, NSPopoverDelegate {
             closed.contentViewController = nil
         }
     }
+
+    func requestCompletion() { document?.editor?.complete(explicit: true) }
+    func formatDocument() {
+        guard let document, !isFormatting, document.editor?.textView.hasMarkedText() != true else { return }
+        isFormatting = true; languageStatus = L10n.text("Formatting…", "正在格式化…")
+        formatTask = Task { @MainActor [weak self, weak document] in
+            guard let self, let document else { return }
+            defer { self.isFormatting = false; self.formatTask = nil }
+            do { try await document.formatSource(requireActive: true); self.languageStatus = L10n.text("Formatted", "已格式化") }
+            catch is CancellationError { self.languageStatus = L10n.text("Formatting cancelled; draft retained.", "格式化已取消，草稿保留。") }
+            catch { self.languageStatus = error.localizedDescription }
+        }
+    }
+    func cancelFormatting() { formatTask?.cancel() }
 
     // --- Undo/Redo Functions ---
     

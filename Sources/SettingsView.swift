@@ -2,6 +2,7 @@ import SwiftUI
 import AppKit
 
 struct SettingsView: View {
+    @ObservedObject private var language = LanguageSettings.shared
     @ObservedObject private var settings = CompilerSettings.shared
     var body: some View {
         Form {
@@ -49,6 +50,20 @@ struct SettingsView: View {
                         .font(.caption).foregroundColor(.secondary)
                 }
             }
+            Section(L10n.text("Language Assistance", "语言辅助")) {
+                Toggle(L10n.text("Enable Tinymist", "启用 Tinymist"), isOn: $language.enabled)
+                Toggle(L10n.text("Automatic completion", "自动补全"), isOn: $language.autoComplete)
+                Toggle(L10n.text("Hover documentation", "悬浮文档提示"), isOn: $language.hover)
+                Toggle(L10n.text("Format on Save", "保存时格式化"), isOn: $language.formatOnSave)
+                HStack {
+                    TextField(L10n.text("Tinymist path (empty = detect)", "Tinymist 路径（留空自动检测）"), text: $language.customPath)
+                    Button(L10n.text("Choose…", "选择…")) { chooseLanguageServer() }
+                }
+                Text(language.executable ?? L10n.text("Tinymist not found; install with brew install tinymist or select an executable.", "未找到 Tinymist；可使用 brew install tinymist 安装，或选择已有可执行文件。"))
+                    .font(.caption).foregroundColor(.secondary).textSelection(.enabled)
+                Text(L10n.text("Option+Esc completes; Shift+Option+F formats. Runs on demand and exits after 60 seconds without requests. Save formatting applies to Cmd+S and Auto Save; closing prompts save the draft immediately. Language-service and PDF-compiler versions are independent.", "Option+Esc 补全，Shift+Option+F 格式化。按需启动，60 秒无请求后释放。保存时格式化用于 Cmd+S 和自动保存；关闭确认直接保存草稿。语言服务与 PDF 编译器版本独立。"))
+                    .font(.caption).foregroundColor(.secondary)
+            }
             Section(L10n.text("Editing", "编辑")) {
                 Toggle(L10n.text("Auto Save", "自动保存"), isOn: $settings.autoSaveEnabled)
                 Text(L10n.text("Save after 1 second without typing. Compilation errors do not prevent saving. External file changes pause saving and retain your draft.", "停止输入 1 秒后保存，编译错误不影响保存。检测到外部修改时暂停保存并保留草稿。"))
@@ -58,13 +73,18 @@ struct SettingsView: View {
             }
         }
         .formStyle(.grouped)
-        .frame(width: 620, height: 600)
+        .frame(width: 620, height: 700)
         .task(id: settings.choice.rawValue + settings.customPath) {
             do { try await Task.sleep(for: .milliseconds(250)) } catch { return }
             await settings.refresh()
         }
     }
 
+    private func chooseLanguageServer() {
+        let panel = NSOpenPanel(); panel.canChooseDirectories = false; panel.allowsMultipleSelection = false
+        panel.title = L10n.text("Choose Tinymist executable", "选择 Tinymist 可执行文件")
+        if panel.runModal() == .OK, let url = panel.url { language.customPath = url.path }
+    }
     private func chooseExecutable() {
         let panel = NSOpenPanel()
         panel.canChooseDirectories = false

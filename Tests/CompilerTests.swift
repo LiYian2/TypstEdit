@@ -26,13 +26,225 @@ struct CompilerTests {
         try await testWatchSuccessErrorRecoveryAndCleanup()
         try await testLowMemoryPreviewReleasesCompiler()
         try await testRapidPreviewRequestsKeepLatestRevision()
+        try testLanguagePositionsEditsSnippetsAndFraming()
+        try await testLanguageConnectionTimeoutCancellationAndCleanup()
+        try await testRealTinymistAssistance()
+        try await testFormattingUndoAndSave()
+        try await testDelayedFormattingNeverOverwritesDraftOrDiscard()
         testGitHunkDetailsAndPatch()
         try await testGitFileHistory()
         testGitStatusAndHunkParsing()
         try await testGitRepositoryAndDraftDecorations()
         try await testAutoSaveAndExternalChanges()
         try await testTerminationCancellationResumesAutoSave()
-        print("PASS: 26 regression groups (compiler/editor/preview, tabs and undo, Git status/draft diffs and commit history, auto-save and external-change protection)")
+        print("PASS: 31 regression groups (compiler/editor/preview, tabs and undo, Git review, LSP assistance/formatting, auto-save and external-change protection)")
+    }
+
+    static func testLanguagePositionsEditsSnippetsAndFraming() throws {
+        let source = "中🙂\r\n#let x=1\r\n"
+        let text = LSPText(source)
+        expectEqual(text.position(5), ["line": 1, "character": 0])
+        expectEqual(text.offset(["line": 0, "character": 3]), 3)
+        expectNil(text.offset(["line": 0, "character": 2])) // Surrogate split
+        expectNil(text.offset(["line": 0, "character": 4])) // CRLF is not part of the line
+        func point(_ line: Int, _ column: Int) -> [String: Int] { ["line": line, "character": column] }
+        let edits = try LanguageEdit.decode([
+            ["range": ["start": point(1, 6), "end": point(1, 6)], "newText": " "],
+            ["range": ["start": point(1, 7), "end": point(1, 7)], "newText": " "]
+        ], source: source)
+        expectEqual(LanguageEdit.applying(edits, to: source), "中🙂\r\n#let x = 1\r\n")
+        expectThrows(try LanguageEdit.decode([
+            ["range": ["start": point(1, 0), "end": point(1, 5)], "newText": ""],
+            ["range": ["start": point(1, 3), "end": point(1, 6)], "newText": ""]
+        ], source: source))
+        let snippet = LanguageSnippet.expand("fn(${1:中🙂}, $1)$0")
+        expectEqual(snippet.0, "fn(中🙂, 中🙂)")
+        expectEqual(snippet.1, NSRange(location: 3, length: 3))
+        let completions = LanguageCompletion.decode([["label": "answer", "insertTextFormat": 2,
+            "textEdit": ["range": ["start": point(0, 1), "end": point(0, 4)], "newText": "answer(${1:value})$0"]]], source: "#ans", fallback: NSRange(location: 1, length: 3))
+        expectEqual(completions.first?.edit.range, NSRange(location: 1, length: 3))
+        expectEqual(completions.first?.edit.text, "answer(value)")
+        expectEqual(LanguageCompletion.documentation(["kind": "markdown", "value": "文档🙂"]), "文档🙂")
+        var framer = LSPFramer(), messages: [[String: Any]] = []
+        let packet = try LSPFramer.encode(["jsonrpc": "2.0", "id": "1", "result": "中文🙂"])
+        for byte in packet { messages += try framer.feed(Data([byte])) }
+        expectEqual(messages.first?["result"] as? String, "中文🙂")
+        expectEqual(try framer.feed(packet + packet).count, 2)
+        var invalid = LSPFramer()
+        expectThrows(try invalid.feed(Data("Content-Length: 99999999\r\n\r\n".utf8)))
+    }
+
+    static func testLanguageConnectionTimeoutCancellationAndCleanup() async throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent("TypstEdit LSP timeout \(UUID())")
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let script = root.appendingPathComponent("server")
+        try "#!/bin/sh\ntrap '' TERM\nwhile true; do sleep 1; done\n".write(to: script, atomically: true, encoding: .utf8)
+        try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: script.path)
+        let client = try LSPConnection(executable: script.path, root: root, options: [:])
+        let pid = client.processID
+        do { _ = try await client.request("ignored", params: [:], timeout: 0.04); fatalError("Expected LSP timeout") }
+        catch LanguageFailure.timeout { }
+        let request = Task { try await client.request("cancelled", params: [:], timeout: 5) }
+        try await Task.sleep(for: .milliseconds(20)); request.cancel()
+        do { _ = try await request.value; fatalError("Expected request cancellation") } catch is CancellationError { }
+        client.close()
+        try await Task.sleep(for: .milliseconds(750))
+        expectTrue(kill(pid, 0) != 0)
+    }
+
+    static func testRealTinymistAssistance() async throws {
+        let executable = ["/opt/homebrew/bin/tinymist", "/usr/local/bin/tinymist"].first(where: FileManager.default.isExecutableFile(atPath:))
+        guard let executable else { print("SKIP: real Tinymist not installed"); return }
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent("TypstEdit real LSP \(UUID())")
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let file = root.appendingPathComponent("中 文.typ")
+        try "disk version".write(to: file, atomically: true, encoding: .utf8)
+        let service = TypstLanguageService()
+        func document(_ source: String) -> LanguageDocument { LanguageDocument(file: file, root: root, source: source, executable: executable, fontArguments: []) }
+        let completionSource = "#let answer = 42\n#ans"
+        let response = try await service.request("textDocument/completion", document: document(completionSource), position: (completionSource as NSString).length)
+        let completions = LanguageCompletion.decode(response, source: completionSource, fallback: NSRange(location: (completionSource as NSString).length - 3, length: 3))
+        expectTrue(completions.contains { $0.label == "answer" })
+        let hoverSource = "😀 #emph[hello]"
+        let hover = try await service.request("textDocument/hover", document: document(hoverSource), position: 5)
+        expectTrue(!LanguageCompletion.documentation((hover as? [String: Any])?["contents"]).isEmpty)
+        let source = "#let x=1+2\n#x\n"
+        let formatted = try await service.request("textDocument/formatting", document: document(source))
+        let edits = try LanguageEdit.decode(formatted as! [[String: Any]], source: source)
+        let new = LanguageEdit.applying(edits, to: source)
+        expectTrue(new.contains("x = 1 + 2"))
+        expectEqual(try String(contentsOf: file, encoding: .utf8), "disk version")
+        await service.stop()
+    }
+
+    @MainActor
+    static func testFormattingUndoAndSave() async throws {
+        guard FileManager.default.isExecutableFile(atPath: "/opt/homebrew/bin/tinymist") else { print("SKIP: native Tinymist formatting"); return }
+        let language = LanguageSettings.shared
+        let old = (language.enabled, language.customPath, language.formatOnSave)
+        language.enabled = true; language.customPath = "/opt/homebrew/bin/tinymist"; language.formatOnSave = true
+        defer { language.enabled = old.0; language.customPath = old.1; language.formatOnSave = old.2 }
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent("TypstEdit format undo \(UUID())")
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let file = root.appendingPathComponent("main.typ"), source = "#let answer=1+2\n#answer\n"
+        try source.write(to: file, atomically: true, encoding: .utf8)
+        let tab = DocumentTab(url: file, projectFolder: root, source: source)
+        let editor = EditorView(text: .constant(source), controller: tab.controller, onCommit: {}, document: tab).makeSession()
+        editor.synchronizeText()
+        editor.textView.setSelectedRange(NSRange(location: 5, length: 6))
+        try await tab.formatSource()
+        expectEqual(editor.textView.selectedRange(), NSRange(location: 5, length: 6))
+        let formatted = tab.source
+        expectTrue(formatted.contains("answer = 1 + 2")); expectEqual(editor.textView.string, formatted)
+        expectEqual(try String(contentsOf: file, encoding: .utf8), source)
+        editor.documentUndoManager.undo(); expectEqual(tab.source, source)
+        editor.documentUndoManager.redo(); expectEqual(tab.source, formatted)
+        editor.documentUndoManager.undo()
+        try await tab.savePrepared()
+        expectEqual(try String(contentsOf: file, encoding: .utf8), formatted)
+        expectFalse(tab.isDirty)
+        editor.textView.setMarkedText("ni", selectedRange: NSRange(location: 2, length: 0), replacementRange: NSRange(location: 0, length: 0))
+        do { try await tab.formatSource(); fatalError("Formatting touched IME composition") } catch is CancellationError { }
+        editor.textView.insertText("", replacementRange: editor.textView.markedRange()); editor.commitCurrentText()
+        language.customPath = "/does/not/exist/tinymist"
+        tab.source += "// retained draft\n"; editor.synchronizeText()
+        try await tab.savePrepared() // Failed formatter still saves the latest draft.
+        expectEqual(try String(contentsOf: file, encoding: .utf8), tab.source)
+        expectTrue(tab.controller.languageStatus.contains(L10n.text("original draft", "保存原稿")))
+        tab.dispose()
+        await TypstLanguageService.shared.stop()
+    }
+
+    @MainActor
+    static func testDelayedFormattingNeverOverwritesDraftOrDiscard() async throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent("TypstEdit delayed format \(UUID())")
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let script = root.appendingPathComponent("fake-tinymist")
+        let program = #"""
+        #!/usr/bin/python3
+        import json,sys,time,os
+        with open(os.path.join(os.path.dirname(sys.argv[0]),'starts'), 'a') as log: log.write(str(os.getpid())+'\n')
+        source=''
+        while True:
+            header={}
+            while True:
+                line=sys.stdin.buffer.readline()
+                if not line: sys.exit(0)
+                if line==b'\r\n': break
+                k,v=line.decode().split(':',1);header[k.lower()]=v.strip()
+            message=json.loads(sys.stdin.buffer.read(int(header['content-length'])))
+            method=message.get('method')
+            if method=='exit': break
+            if method=='textDocument/didOpen': source=message['params']['textDocument']['text']
+            if method=='textDocument/didChange': source=message['params']['contentChanges'][0]['text']
+            if 'id' not in message: continue
+            result=None
+            if method=='initialize': result={'capabilities':{'positionEncoding':'utf-16'}}
+            if method=='textDocument/formatting':
+                time.sleep(.2)
+                lines=source.split('\n')
+                result=[{'range':{'start':{'line':0,'character':0},'end':{'line':len(lines)-1,'character':len(lines[-1])}},'newText':source.replace('x=1','x = 1')}]
+            body=json.dumps({'jsonrpc':'2.0','id':message['id'],'result':result}).encode()
+            sys.stdout.buffer.write(('Content-Length: %d\r\n\r\n'%len(body)).encode()+body);sys.stdout.buffer.flush()
+        """#
+        try program.write(to: script, atomically: true, encoding: .utf8)
+        try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: script.path)
+        let service = TypstLanguageService()
+        let context = LanguageDocument(file: root.appendingPathComponent("concurrency.typ"), root: root, source: "#let x=1\n", executable: script.path, fontArguments: [])
+        _ = try await service.request("textDocument/hover", document: context, position: 5)
+        await service.stop()
+        try await withThrowingTaskGroup(of: Void.self) { group in
+            for _ in 0..<10 { group.addTask { _ = try await service.request("textDocument/hover", document: context, position: 5) } }
+            try await group.waitForAll()
+        }
+        let starts = try String(contentsOf: root.appendingPathComponent("starts"), encoding: .utf8).split(separator: "\n")
+        expectEqual(starts.count, 2) // One initial process and one shared replacement.
+        await service.stop()
+        try await Task.sleep(for: .milliseconds(750))
+        for pid in starts { expectTrue(kill(Int32(pid)!, 0) != 0) }
+        let language = LanguageSettings.shared, old = (language.enabled, language.customPath, language.formatOnSave)
+        language.enabled = true; language.customPath = script.path; language.formatOnSave = true
+        defer { language.enabled = old.0; language.customPath = old.1; language.formatOnSave = old.2 }
+        func tab(_ name: String) throws -> DocumentTab {
+            let file = root.appendingPathComponent(name + ".typ"), source = "#let x=1\n"
+            try source.write(to: file, atomically: true, encoding: .utf8)
+            return DocumentTab(url: file, projectFolder: root, source: source)
+        }
+        let concurrent = try tab("concurrent")
+        let formatting = Task { try await concurrent.formatSource() }
+        let saving = Task { try await concurrent.savePrepared() }
+        try await formatting.value; try await saving.value
+        expectEqual(concurrent.source, "#let x = 1\n")
+        expectEqual(try String(contentsOf: concurrent.id, encoding: .utf8), concurrent.source)
+        expectFalse(concurrent.isDirty)
+        concurrent.dispose()
+        let first = try tab("stale")
+        let pending = Task { try await first.formatSource() }
+        try await Task.sleep(for: .milliseconds(80)); first.source = "#let x=2\n"
+        do { try await pending.value; fatalError("Stale formatting applied") } catch is CancellationError { }
+        expectEqual(first.source, "#let x=2\n")
+        expectEqual(try String(contentsOf: first.id, encoding: .utf8), "#let x=1\n")
+        let discarded = try tab("discarded")
+        let save = Task { try await discarded.savePrepared() }
+        try await Task.sleep(for: .milliseconds(80)); discarded.dispose()
+        do { try await save.value; fatalError("Discarded tab was saved") } catch is CancellationError { }
+        expectEqual(try String(contentsOf: discarded.id, encoding: .utf8), "#let x=1\n")
+        let auto = try tab("auto")
+        auto.configureAutoSave(true); auto.source += "// new draft\n"; auto.scheduleAutoSave(delay: .milliseconds(20))
+        try await Task.sleep(for: .milliseconds(800))
+        expectEqual(try String(contentsOf: auto.id, encoding: .utf8), "#let x = 1\n// new draft\n")
+        expectFalse(auto.isDirty)
+        let formattedAuto = try tab("formatted-auto")
+        formattedAuto.configureAutoSave(true)
+        try await formattedAuto.formatSource()
+        try await Task.sleep(for: .milliseconds(1300))
+        expectEqual(try String(contentsOf: formattedAuto.id, encoding: .utf8), "#let x = 1\n")
+        expectFalse(formattedAuto.isDirty)
+        first.dispose(); auto.dispose(); formattedAuto.dispose(); await TypstLanguageService.shared.stop()
     }
 
     @MainActor

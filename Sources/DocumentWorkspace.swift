@@ -7,7 +7,13 @@ final class DocumentTab: ObservableObject, Identifiable {
     let url: URL
     let projectFolder: URL
     // Notify only after the canonical text changes: synchronous redraws must see the new text.
-    var source: String { didSet { if source != oldValue { objectWillChange.send(); scheduleAutoSave() } } }
+    var source: String { didSet { if source != oldValue { sourceRevision &+= 1; objectWillChange.send(); if !isApplyingFormat { cancelLanguageOperation(); scheduleAutoSave() } } } }
+    private(set) var sourceRevision = 0
+    private var isApplyingFormat = false
+    private var disposed = false
+    private var languageTail: Task<Void, Never>?
+    private var languageOperations: [UUID: Task<Void, Error>] = [:]
+    private var activeLanguageOperation: UUID?
     @Published private(set) var savedSource: String
     @Published private(set) var autoSaveError: String?
     private var autoSaveEnabled = false
@@ -48,6 +54,75 @@ final class DocumentTab: ObservableObject, Identifiable {
         }
     }
 
+    private func languageOperation(_ operation: @escaping @MainActor () async throws -> Void) async throws {
+        let previous = languageTail, id = UUID()
+        let task = Task { @MainActor [weak self] in
+            await previous?.value
+            guard let self, !self.disposed, !Task.isCancelled else { throw CancellationError() }
+            self.activeLanguageOperation = id
+            defer { if self.activeLanguageOperation == id { self.activeLanguageOperation = nil } }
+            try await operation()
+        }
+        languageOperations[id] = task
+        languageTail = Task { _ = try? await task.value }
+        defer { languageOperations.removeValue(forKey: id) }
+        try await withTaskCancellationHandler(operation: { try await task.value }, onCancel: { task.cancel() })
+    }
+    func cancelLanguageOperation() {
+        guard !isApplyingFormat, let id = activeLanguageOperation else { return }
+        languageOperations[id]?.cancel()
+    }
+    func formatSource(requireActive: Bool = false) async throws {
+        try await languageOperation { [self] in try await performFormat(requireActive: requireActive) }
+        scheduleAutoSave()
+    }
+    private func performFormat(requireActive: Bool) async throws {
+        guard !disposed else { throw CancellationError() }
+        let context = try LanguageSettings.shared.context(for: self)
+        let revision = sourceRevision, session = editor, selection = editor?.textView.selectedRange()
+        guard editor?.textView.hasMarkedText() != true else { throw CancellationError() }
+        let response = try await TypstLanguageService.shared.request("textDocument/formatting", document: context)
+        guard !disposed, !Task.isCancelled, sourceRevision == revision, source == context.source,
+              editor?.textView.hasMarkedText() != true else { throw CancellationError() }
+        if requireActive {
+            guard let session, session.parent?.document === self, session.textView.selectedRange() == selection else { throw CancellationError() }
+        }
+        guard let values = response as? [[String: Any]] else {
+            if response is NSNull { return }; throw LanguageFailure.invalidMessage
+        }
+        let edits = try LanguageEdit.decode(values, source: context.source)
+        let formatted = LanguageEdit.applying(edits, to: context.source)
+        guard formatted != source else { return }
+        isApplyingFormat = true
+        defer { isApplyingFormat = false }
+        let nativeNotifies = session?.parent?.document === self
+        if let session {
+            guard session.textView.string == context.source else { throw CancellationError() }
+            session.applyAssistedSource(formatted)
+            source = session.textView.string
+        } else { source = formatted }
+        if !nativeNotifies { NotificationCenter.default.post(name: .documentSourceDidChange, object: self) }
+    }
+
+    /// Formatting failures never prevent saving the current draft.
+    func savePrepared() async throws {
+        try await languageOperation { [self] in try await performSave() }
+    }
+    private func performSave() async throws {
+        guard !disposed else { throw CancellationError() }
+        let revision = sourceRevision
+        if LanguageSettings.shared.enabled && LanguageSettings.shared.formatOnSave {
+            do { try await performFormat(requireActive: false) }
+            catch is CancellationError { throw CancellationError() }
+            catch {
+                guard sourceRevision == revision else { throw CancellationError() }
+                controller.languageStatus = L10n.text("Formatting unavailable; saving the original draft. ", "格式化不可用，保存原稿。") + error.localizedDescription
+            }
+        }
+        guard !disposed, !Task.isCancelled else { throw CancellationError() }
+        try save()
+    }
+
     func configureAutoSave(_ enabled: Bool) {
         autoSaveEnabled = enabled
         autoSaveTask?.cancel()
@@ -69,18 +144,22 @@ final class DocumentTab: ObservableObject, Identifiable {
             guard let self, self.autoSaveEnabled, !self.autoSaveSuspended, !Task.isCancelled, self.source == revision,
                   self.editor?.textView.hasMarkedText() != true else { return }
             do {
-                try self.save()
+                try await self.savePrepared()
                 NotificationCenter.default.post(name: .documentDidSave, object: self)
-            } catch {
+            } catch is CancellationError { return } catch {
                 self.autoSaveError = error.localizedDescription
             }
         }
     }
 
     func dispose() {
+        disposed = true
+        for operation in languageOperations.values { operation.cancel() }
         configureAutoSave(false)
         editor?.detach()
         editor = nil
+        let file = id
+        Task { await TypstLanguageService.shared.close(file: file) }
     }
 }
 

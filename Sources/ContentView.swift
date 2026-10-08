@@ -59,6 +59,13 @@ struct ContentView: View {
                                onCommit: {}, document: tab)
                         .environmentObject(themeManager)
                         .padding(8)
+                    if !tab.controller.languageStatus.isEmpty {
+                        HStack {
+                            Text(tab.controller.languageStatus).font(.caption).lineLimit(2).textSelection(.enabled)
+                            Spacer()
+                            Button { tab.controller.languageStatus = "" } label: { Image(systemName: "xmark") }.buttonStyle(.plain)
+                        }.foregroundColor(.secondary).padding(8)
+                    }
                     if let error = tab.autoSaveError {
                         HStack {
                             Text(L10n.text("Saving paused: ", "保存已暂停：") + error)
@@ -316,6 +323,11 @@ Rectangle().fill(Color.gray.opacity(0.3)).frame(width: 1, height: 16)
                             .help(L10n.text("File History", "文件历史"))
                             .accessibilityLabel(L10n.text("File History", "文件历史"))
 
+                            Button { editorController.formatDocument() } label: { Image(systemName: "text.alignleft") }
+                                .buttonStyle(.plain).disabled(editorController.isFormatting)
+                                .help(L10n.text("Format Document (Shift+Option+F)", "格式化文档（Shift+Option+F）"))
+                                .accessibilityLabel(L10n.text("Format Document", "格式化文档"))
+
                             Button { showPreview.toggle() } label: {
                                 Image(systemName: "sidebar.right")
                                     .foregroundColor(showPreview ? themeManager.textColor : .secondary)
@@ -374,7 +386,7 @@ Rectangle().fill(Color.gray.opacity(0.3)).frame(width: 1, height: 16)
             canClose: confirmDiscard, onClose: { cancelCompilation(); compiler.cleanUp(); workspace.closeAll() },
             onTerminate: { workspace.closeAll(); cancelCompilation(); compiler.cleanUp(waitForExit: true) },
             onCancelClose: { for tab in workspace.tabs { tab.suspendAutoSave(false) } }))
-        .focusedSceneValue(\.documentActions, DocumentActions(open: openFile, save: saveFile, export: exportPDF, refresh: refreshPreview, insert: insertSnippet, hasDocument: selectedFile != nil))
+        .focusedSceneValue(\.documentActions, DocumentActions(open: openFile, save: saveFile, export: exportPDF, refresh: refreshPreview, insert: insertSnippet, complete: { editorController.requestCompletion() }, format: { editorController.formatDocument() }, hasDocument: selectedFile != nil))
         .alert(L10n.text("Operation failed", "操作失败"), isPresented: Binding(get: { operationError != nil }, set: { if !$0 { operationError = nil } })) {
             Button(L10n.text("OK", "确定")) { operationError = nil }
         } message: { Text(operationError ?? "") }
@@ -587,27 +599,17 @@ Rectangle().fill(Color.gray.opacity(0.3)).frame(width: 1, height: 16)
     func saveFile() {
         commitActiveEditor(endEditing: false)
         guard let tab = workspace.active else { return }
-        do {
-            try tab.save()
-            gitRevision = UUID()
-            RecentFilesManager.shared.add(url: tab.url)
-            
-            // Trigger compilation to generate PDF
-            scheduleCompilation()
-            
-            // UI Feedback
-            lastSaved = tab.lastSaved
-            withAnimation {
-                showSavePopup = true
-            }
-            // Hide after delay
-            DispatchQueue.main.asyncAfter(deadline: .now() + 2) {
-                withAnimation {
-                    showSavePopup = false
-                }
-            }
-        } catch {
-            operationError = error.localizedDescription
+        Task { @MainActor in
+            do {
+                try await tab.savePrepared()
+                NotificationCenter.default.post(name: .documentDidSave, object: tab)
+                RecentFilesManager.shared.add(url: tab.url)
+                guard workspace.active === tab else { return }
+                gitRevision = UUID(); scheduleCompilation(); lastSaved = tab.lastSaved
+                withAnimation { showSavePopup = true }
+                DispatchQueue.main.asyncAfter(deadline: .now() + 2) { withAnimation { showSavePopup = false } }
+            } catch is CancellationError { /* A changed or closed draft must never be saved by an old request. */ }
+            catch { operationError = error.localizedDescription }
         }
     }
 

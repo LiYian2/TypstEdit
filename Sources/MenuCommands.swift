@@ -6,6 +6,8 @@ struct DocumentActions {
     let export: () -> Void
     let refresh: () -> Void
     let insert: (String) -> Void
+    let complete: () -> Void
+    let format: () -> Void
     let hasDocument: Bool
 }
 struct DocumentActionsKey: FocusedValueKey { typealias Value = DocumentActions }
@@ -30,6 +32,12 @@ struct AppMenuCommands: Commands {
             Button(L10n.text("Export PDF…", "导出 PDF…")) { actions?.export() }
                 .keyboardShortcut("e", modifiers: [.command, .shift])
                 .disabled(actions?.hasDocument != true)
+        }
+        CommandGroup(after: .textEditing) {
+            Button(L10n.text("Complete Typst", "Typst 自动补全")) { actions?.complete() }
+                .keyboardShortcut(.escape, modifiers: .option).disabled(actions?.hasDocument != true)
+            Button(L10n.text("Format Document", "格式化文档")) { actions?.format() }
+                .keyboardShortcut("f", modifiers: [.option, .shift]).disabled(actions?.hasDocument != true)
         }
         CommandMenu(L10n.text("Preview", "预览")) {
             Button(L10n.text("Refresh Preview", "刷新预览")) { actions?.refresh() }
